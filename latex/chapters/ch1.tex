@@ -21,9 +21,9 @@ carries an \textit{INTERNAL USE ONLY} badge, presents a clean web interface, and
 exposes a single utility endpoint that pings a user-supplied hostname. That
 endpoint, \texttt{/ping}, executes the following on the server:
 
-\begin{verbatim}
+\begin{lstlisting}[language=python]
 os.popen("ping -c 3 " + host)
-\end{verbatim}
+\end{lstlisting}
 
 A semicolon in \texttt{host} terminates the \texttt{ping} command. Every
 character that follows runs in the same shell, as the same user --- root inside
@@ -42,7 +42,7 @@ touching a kernel vulnerability.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=\textwidth]{images/attack_chain.png}
+\includegraphics[width=\textwidth]{images/ch1/attack_chain.png}
 % DIAGRAM 1.1 --- Attack Chain Overview
 % Horizontal left-to-right flow with 5 nodes across two swim lanes.
 % Swim lane 1 (VM2 -- Attacker): Attacker (VM2) -> HTTP GET /ping?host=8.8.8.8;id
@@ -122,15 +122,15 @@ Linux host:
 
 Mitigation requires two targeted fixes. At the application layer, replacing
 
-\begin{verbatim}
+\begin{lstlisting}[language=python]
 os.popen("ping -c 3 " + host)
-\end{verbatim}
+\end{lstlisting}
 
 \noindent with
 
-\begin{verbatim}
+\begin{lstlisting}[language=python]
 subprocess.run(['ping', '-c', '3', host], capture_output=True)
-\end{verbatim}
+\end{lstlisting}
 
 removes the shell entirely. The user-supplied value is passed as a list element
 to \texttt{execve} and is never interpreted by a shell parser, so no injected
@@ -165,13 +165,13 @@ VM1 runs the Docker daemon (\texttt{dockerd}) as a root-owned system service.
 \texttt{docker} by default. The NetDiag container is started by
 \texttt{setup.sh} with the following command:
 
-\begin{verbatim}
+\begin{lstlisting}[language=bash]
 docker run -d \
   -p 5000:5000 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --name netdiag-app \
   netdiag
-\end{verbatim}
+\end{lstlisting}
 
 Each flag has a specific OS-level effect. \texttt{-d} runs the container in
 detached mode, disconnecting it from the terminal's standard input and placing
@@ -203,9 +203,9 @@ confirming that input reaches the shell unfiltered.
 
 \subsection{Network Topology}
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
-\includegraphics[width=\textwidth]{images/lab_network_topology.png}
+\includegraphics[width=\textwidth]{images/ch1/lab_network_topology.png}
 % DIAGRAM 1.2 --- Lab Network Topology
 % Two side-by-side boxes: VM1 (192.168.98.4) and VM2 (192.168.98.5).
 % Inside VM1: Host OS (Kali) box containing a nested Docker container box

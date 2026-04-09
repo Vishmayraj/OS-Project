@@ -3,6 +3,28 @@
 \usepackage{graphicx}
 \usepackage{geometry}
 \usepackage{hyperref}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{gray!10},
+  frame=single,
+  rulecolor=\color{black},
+  breaklines=true,
+  tabsize=2,
+  showstringspaces=false,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{green!50!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=1em,
+  framexleftmargin=1em,
+  aboveskip=1.2em, 
+  belowskip=1.2em   
+}
 
 \geometry{margin=1in}
 
@@ -18,6 +40,6 @@
 
 \input{chapters/ch1}
 \input{chapters/ch2}
-% \input{chapters/ch3}
+\input{chapters/ch3}
 
 \end{document}

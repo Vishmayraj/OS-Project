@@ -23,7 +23,7 @@ child process---must cross the kernel--user boundary via a \textit{system call}.
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.4\textwidth]{images/linux_privilege_rings.png}
+\includegraphics[width=0.4\textwidth]{images/ch2/linux_privilege_rings.png}
 % Diagram: Linux Privilege Rings / Kernel--User Space Boundary
 % Shows Ring 0 (kernel), Ring 3 (userland), syscall crossing point,
 % container processes sitting in ring 3 alongside host processes
@@ -67,7 +67,7 @@ processes without a kernel exploit.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.8\textwidth]{images/syscall_flow.png}
+\includegraphics[width=0.8\textwidth]{images/ch2/syscall_flow.png}
 % Diagram: Syscall Flow --- User Space to Kernel and Back
 % Shows: user process → syscall instruction → kernel dispatch table → handler → return value
 \caption{Syscall Flow: User Space to Kernel and Back}
@@ -161,7 +161,7 @@ in this report.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.8\textwidth]{images/linux_namespace_hierarchy.png}
+\includegraphics[width=0.8\textwidth]{images/ch2/linux_namespace_hierarchy.png}
 % Diagram: Linux Namespace Hierarchy --- Host vs Container View
 % Shows host namespace set vs container namespace set;
 % shared kernel underneath; PID/NET/MNT split
@@ -227,7 +227,7 @@ mounted at the container root.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.6\textwidth]{images/overlayfs_and_bind_mount.png}
+\includegraphics[width=0.6\textwidth]{images/ch2/overlayfs_and_bind_mount.png}
 % Diagram: OverlayFS + Bind Mount --- How docker.sock Pierces Namespace Isolation
 % Shows: image layers (lower), writable layer (upper), merged view,
 % bind mount path from host into container
@@ -310,7 +310,7 @@ which unifies all subsystems under a single hierarchy.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.6\textwidth]{images/cgroup_hierarchy.png}
+\includegraphics[width=0.6\textwidth]{images/ch2/cgroup_hierarchy.png}
 % Diagram: cgroup Hierarchy --- Host vs Container Resource Slice
 % Shows: host cgroup root → docker/ slice → per-container cgroup;
 % subsystems hanging off each node
@@ -543,7 +543,7 @@ relevant to container isolation are:
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.9\textwidth]{images/kernel_view.png}
+\includegraphics[width=0.9\textwidth]{images/ch2/kernel_view.png}
 % Diagram: Kernel View --- Host Process vs Container Process (task\_struct comparison)
 % Shows: two task\_struct boxes side by side; host process with host nsproxy;
 % container process with its own nsproxy pointing to new NS objects;
