@@ -1,0 +1,396 @@
+\chapter{Mitigation and Hardening}
+
+\section{Never Mount docker.sock in Production}
+
+The complete attack chain in this project is enabled by a single flag in the \texttt{docker run} command:
+
+\begin{lstlisting}[language=bash]
+-v /var/run/docker.sock:/var/run/docker.sock
+\end{lstlisting}
+
+Removing this flag eliminates the escape vector entirely. The corrected command for this project:
+
+\begin{lstlisting}[language=bash]
+docker run -d \
+    -p 5000:5000 \
+    --name netdiag-app \
+    netdiag
+\end{lstlisting}
+
+Without the socket mount, the container has no path to the host Docker daemon. Even with full root-level RCE inside the container --- which the command injection vulnerability still provides --- the attacker cannot reach any host resources beyond what is accessible through the container's own network interface and mounted volumes. The RCE is contained within the container boundary.
+
+The socket mount is commonly seen in monitoring and CI/CD containers that need to query or manage other containers on the same host. If this capability is genuinely required, the correct approach is a scoped proxy (Section~\ref{sec:socket-proxy}) rather than mounting the raw socket. Mounting the raw socket is never the appropriate choice in a production deployment because it grants complete daemon access with no scope restriction.
+
+% ---
+
+\section{Docker Socket Proxy}
+\label{sec:socket-proxy}
+
+The Tecnativa Docker Socket Proxy (\texttt{ghcr.io/tecnativa/docker-socket-proxy}) provides a controlled alternative when a container genuinely needs Docker API access. The proxy container mounts the host socket and exposes a scoped HTTP API to other containers over TCP. Application containers talk to the proxy, not to the raw socket.
+
+Deployment with Docker Compose:
+
+\begin{lstlisting}
+services:
+  socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - CONTAINERS=1   # allow GET /containers
+      - POST=0         # block all POST (no container creation)
+      - DELETE=0       # block all DELETE
+    networks:
+      - proxy-net
+
+  app:
+    image: netdiag
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+    networks:
+      - proxy-net
+\end{lstlisting}
+
+The application container sets \texttt{DOCKER\_HOST} to the proxy's TCP address. All Docker API calls from the application go to the proxy. The proxy enforces which API methods and endpoints are permitted based on environment variable configuration.
+
+How this blocks the escape: with \texttt{POST=0}, the proxy rejects all \texttt{POST} requests to the Docker API. Creating a new container requires \texttt{POST /containers/create} --- the exact call the attacker makes after gaining RCE. The proxy denies this request regardless of what credentials or capabilities the caller has.
+
+For a read-only container monitoring use case, \texttt{CONTAINERS=1} combined with \texttt{POST=0} and \texttt{DELETE=0} is sufficient. The application can list and inspect containers but cannot create, start, stop, or delete them.
+
+The proxy's own security posture must be maintained: the proxy container itself mounts the raw socket, so a compromise of the proxy container is equivalent to a compromise of the socket mount. The proxy container should run without network exposure to untrusted code paths and should be isolated on a dedicated internal network segment.
+
+% ---
+
+\section{Rootless Docker}
+
+Standard Docker runs \texttt{dockerd} as UID 0 (root). This means that any process which gains access to \texttt{/var/run/docker.sock} effectively has root-equivalent access to the host. Rootless Docker restructures the daemon to run as an unprivileged user, using Linux user namespaces to simulate root inside containers.
+
+Setup:
+
+\begin{lstlisting}[language=bash]
+dockerd-rootless-setuptool.sh install
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
+\end{lstlisting}
+
+How rootless Docker changes the attack chain:
+
+\begin{itemize}
+    \item \texttt{dockerd} runs as e.g. UID 1000, not UID 0. Operations performed via the socket execute with the privileges of UID 1000, not root.
+    \item The socket is located at \texttt{\$XDG\_RUNTIME\_DIR/docker.sock} rather than
+\texttt{/var/run/docker.sock}. A bind-mount of \texttt{/var/run/docker.sock} would find nothing at that path.
+    \item Inside containers, UID 0 is mapped to a high UID on the host (e.g., UID 100000+) via user namespace UID remapping. A process that is root inside the container is not root on the host.
+    \item A file written via the escape to the host filesystem --- such as \texttt{/tmp/escaped.txt} --- would be owned by UID 100000+ on the host, not by root. It cannot overwrite root-owned files or modify system configuration.
+\end{itemize}
+
+The practical result is that even a successful socket-based escape produces operations that execute as a low-privilege user on the host. The attacker cannot write to \texttt{/etc/}, \texttt{/root/}, or other root-owned locations, and cannot install system packages or load kernel modules.
+
+Rootless Docker has limitations. Some features are unavailable or require additional configuration: \texttt{--network=host} and certain device mounts are restricted. The host kernel must have user namespace support enabled (\texttt{CONFIG\_USER\_NS=y}). Performance is marginally lower due to namespace overhead on filesystem operations.
+
+Rootless Docker is best understood as defense-in-depth. It reduces the impact of a socket compromise rather than preventing it. A socket proxy (Section~\ref{sec:socket-proxy}) or removal of the socket mount (Section~11.1) remains the primary control.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Standard Docker vs. rootless Docker: UID mapping and privilege scope comparison}
+\end{figure}
+
+% ---
+
+\section{Podman as a Daemonless Alternative}
+
+Podman is an OCI-compliant container runtime that eliminates the central daemon architecture entirely. There is no persistent \texttt{dockerd} process and no \texttt{/var/run/docker.sock} by default. Each \texttt{podman run} invocation directly calls \texttt{runc} or \texttt{crun} to manage the container lifecycle without passing through a privileged intermediary.
+
+How Podman eliminates the attack vector:
+
+\begin{itemize}
+    \item With no daemon, there is no socket to bind-mount. The \texttt{-v /var/run/docker.sock} flag would fail because the path does not exist.
+    \item With no shared daemon, there is no privileged process that all container operations flow through. Compromising one container's process space gives the attacker access to that container's resources only.
+    \item Containers run as the invoking user by default with user namespace remapping. Container UID 0 maps to a high host UID, consistent with rootless Docker's behavior.
+\end{itemize}
+
+Podman maintains Docker CLI compatibility for most common operations:
+
+\begin{lstlisting}[language=bash]
+alias docker=podman
+\end{lstlisting}
+
+The \texttt{podman system service} command can optionally expose a socket, but it is user-scoped and opt-in --- the socket exists only while the service is explicitly running and is accessible only by the invoking user.
+
+Security comparison:
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+\textbf{Property} & \textbf{Docker (default)} & \textbf{Podman (default)} \\
+\hline
+Daemon & Root daemon & No daemon \\
+Socket & \texttt{/var/run/docker.sock} (root) & None by default \\
+Container UID & Root unless specified & User UID (remapped) \\
+Socket mount risk & Critical & Not applicable \\
+\hline
+\end{tabular}
+\end{center}
+
+Podman's limitations relative to Docker: no native Swarm equivalent, some Docker Compose features differ in behaviour, and enterprise tooling ecosystem maturity is lower. For teams that require Docker Compose workflows, \texttt{podman-compose} provides compatibility but has feature gaps.
+
+% ---
+
+\section{Fixing the Code --- subprocess vs os.popen}
+
+The command injection vulnerability exists independently of the container configuration. Removing the socket mount prevents the escape but does not eliminate RCE. The correct fix at the code level removes the shell interpolation that makes injection possible.
+
+Vulnerable code:
+
+\begin{lstlisting}[language=python]
+result = os.popen("ping -c 3 " + host).read()
+\end{lstlisting}
+
+\texttt{os.popen()} passes its argument to \texttt{/bin/sh -c}. String concatenation means the user-supplied \texttt{host} value becomes part of the shell command. The shell interprets metacharacters in \texttt{host} as syntax.
+
+Fixed code:
+
+\begin{lstlisting}[language=python]
+import subprocess
+
+result = subprocess.run(
+    ['ping', '-c', '3', host],
+    capture_output=True,
+    text=True,
+    timeout=10
+).stdout
+\end{lstlisting}
+
+Why the list form eliminates injection: when \texttt{subprocess.run()} receives a list rather than a string, it calls \texttt{execve("/bin/ping", ["-c", "3", host], environ)} directly. No shell is involved. The value of \texttt{host} is passed as \texttt{argv[3]} to the \texttt{ping} binary as a literal argument. The \texttt{ping} binary receives \texttt{8.8.8.8;id} as a single hostname string, determines it is not a valid host, and exits with an error. The \texttt{id} suffix is never evaluated as a command.
+
+Additional improvements in the fixed version:
+\begin{itemize}
+    \item \texttt{timeout=10} prevents indefinite hang if the target host is unreachable. \texttt{os.popen()} has no built-in timeout mechanism.
+    \item \texttt{capture\_output=True} explicitly captures stdout and stderr into \texttt{.stdout} and \texttt{.stderr} attributes. The intent is unambiguous and no implicit pipe is created.
+\end{itemize}
+
+A common mistake that reintroduces the vulnerability:
+
+\begin{lstlisting}[language=python]
+subprocess.run("ping -c 3 " + host, shell=True)
+\end{lstlisting}
+
+This fix eliminates RCE regardless of how the container is configured. With RCE gone, the docker.sock escape becomes unreachable: the attacker has no code execution path to reach the socket.
+
+% ---
+
+\section{Input Validation and Allowlisting}
+
+Input validation is a second layer of defence, not a replacement for the \texttt{subprocess} fix. It provides defence-in-depth: even if a future code change reintroduces a shell invocation, the allowlist prevents injection characters from reaching it.
+
+Allowlist-based validation:
+
+\begin{lstlisting}[language=python]
+import re
+from flask import abort
+
+VALID_HOST = re.compile(r'^[a-zA-Z0-9.\-]{1,253}$')
+
+@app.route('/ping')
+def ping():
+    host = request.args.get('host', '')
+    if not VALID_HOST.match(host):
+        abort(400)
+    result = subprocess.run(
+        ['ping', '-c', '3', host],
+        capture_output=True,
+        text=True,
+        timeout=10
+    ).stdout
+    return render_template('index.html', result=result)
+\end{lstlisting}
+
+The regex permits only alphanumeric characters, dots, and hyphens --- the valid character set for a hostname or IP address. It rejects semicolons, ampersands, pipes, dollar signs, backticks, spaces, and all other shell metacharacters at the input boundary before any command construction occurs.
+
+Allowlisting is preferred over blocklisting. A blocklist approach attempts to enumerate and reject known dangerous characters. This is reliably bypassed via URL encoding, Unicode equivalents, or metacharacters that the blocklist author did not anticipate. An allowlist accepts only a known-safe set and rejects everything else, so novel bypass techniques do not help the attacker.
+
+Additional validation layers that strengthen the control:
+
+\begin{itemize}
+    \item Length limit enforcement: \texttt{len(host) > 253 $\rightarrow$ abort(400)}. DNS hostnames have a defined maximum length; values exceeding it are either invalid or crafted.
+    \item Strict IP validation using the standard library: \texttt{ipaddress.ip\_address(host)} raises \texttt{ValueError} on non-IP strings, enabling an IP-only mode if domain name lookup is not required by the application.
+    \item Rate limiting via \texttt{flask-limiter}: prevents rapid sequential injection probing that an attacker might use to enumerate valid injection payloads despite validation failures.
+\end{itemize}
+
+The defence-in-depth principle applies: \texttt{subprocess} list-form invocation eliminates the vulnerability at the execution layer; input validation eliminates dangerous characters before they reach any command construction logic. Both controls together are more robust than either alone.
+
+% ---
+
+\section{Running Containers as Non-Root}
+
+The Dockerfile in this project does not include a \texttt{USER} directive, so the Flask process runs as UID 0 inside the container. This means every \texttt{fork()}/\texttt{exec()} child inherits root, including the reverse shell and all subsequent commands the attacker runs. Adding a non-root user to the Dockerfile breaks this chain.
+
+Fixed Dockerfile:
+
+\begin{lstlisting}
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install flask
+RUN useradd -m -u 1001 -s /bin/bash appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+EXPOSE 5000
+CMD ["python3", "app.py"]
+\end{lstlisting}
+
+With this change, the Flask process runs as UID 1001. Every child process it spawns inherits UID 1001.
+
+Impact on the attack chain:
+
+\begin{itemize}
+    \item \texttt{ls -la /var/run/docker.sock} shows permissions \texttt{srw-rw---- root:docker}. UID 1001 is neither the owner nor a member of the \texttt{docker} group, so opening the socket fails with \texttt{EACCES}.
+    \item \texttt{apt-get install docker.io} requires write access to \texttt{/usr/bin/} and the package database, both owned by root. The command fails.
+    \item RCE is still achievable: the command injection vulnerability operates independently of the process UID. However, the attacker's shell runs as UID 1001, and the socket is inaccessible. The escape is blocked.
+\end{itemize}
+
+The \texttt{--user} flag provides a runtime-level override if the Dockerfile cannot be modified:
+
+\begin{lstlisting}[language=bash]
+docker run --user 1001 netdiag
+\end{lstlisting}
+
+One pitfall to avoid explicitly: do not add \texttt{appuser} to the \texttt{docker} group. The \texttt{docker} group grants read/write access to \texttt{/var/run/docker.sock}, which is equivalent to giving the user root-level daemon access. Group membership would negate the protection that the non-root user provides.
+
+% ---
+
+\section{Read-Only Filesystems}
+
+The \texttt{--read-only} flag mounts the container's root filesystem without an OverlayFS write layer. Any attempt to write to the container filesystem --- including \texttt{/usr/bin/}, \texttt{/tmp/}, and \texttt{/var/} --- fails with \texttt{EROFS} (read-only filesystem).
+
+Impact on the attack chain:
+
+\begin{itemize}
+    \item \texttt{apt-get update} fails immediately on the first attempt to write to \texttt{/var/lib/apt/}. The Docker CLI cannot be installed, so the attacker has no tool to communicate with the daemon socket even if it is accessible.
+    \item The reverse shell can still execute: existing binaries such as \texttt{bash}, \texttt{python3}, and \texttt{nc} are already present in the image and are unaffected by read-only mounting. The attacker retains code execution but cannot install additional tools.
+\end{itemize}
+
+\texttt{/tmp} is also read-only under this flag, which breaks some applications. The recommended pattern is to add specific \texttt{tmpfs} mounts for directories that legitimately need write access:
+
+\begin{lstlisting}[language=bash]
+docker run --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid \
+    --tmpfs /var/run:rw,noexec,nosuid \
+    netdiag
+\end{lstlisting}
+
+The \texttt{noexec} mount option prevents binaries written to \texttt{/tmp} from being executed. An attacker who downloads a payload dropper to \texttt{/tmp} cannot run it. \texttt{nosuid} prevents setuid binaries staged in \texttt{/tmp} from escalating privileges.
+
+\texttt{--read-only} does not prevent network-based exfiltration or socket-based escape if the socket remains mounted. It is a hardening layer that limits the attacker's ability to install tools and establish persistence, not a control that blocks the primary escape vector.
+
+% ---
+
+\section{Seccomp and AppArmor Profiles}
+
+Docker applies a default seccomp profile to all containers, blocking approximately 44 system calls including \texttt{kexec\_load} and restricted forms of \texttt{mount}. This default profile does not block \texttt{socket(AF\_UNIX)}, \texttt{connect()}, or the calls needed for the reverse shell TCP connection. Custom profiles can restrict further.
+
+\subsection{Custom Seccomp Profile}
+
+A whitelist-only seccomp profile that permits only the syscalls required by the application:
+
+\begin{lstlisting}
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "open", "close", "execve",
+        "fork", "clone", "wait4", "exit_group",
+        "socket", "connect", "send", "recv",
+        "mmap", "brk", "futex"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+\end{lstlisting}
+
+The \texttt{defaultAction: SCMP\_ACT\_ERRNO} causes any syscall not in the allow list to return \texttt{EPERM}. Removing \texttt{clone} with namespace creation flags prevents \texttt{unshare()} inside the container, blocking namespace escape techniques.
+
+Apply to a container:
+
+\begin{lstlisting}[language=bash]
+docker run --security-opt seccomp=custom.json netdiag
+\end{lstlisting}
+
+\subsection{AppArmor Profile}
+
+An AppArmor profile can explicitly deny access to the docker socket path, enforced at the Linux Security Module layer:
+
+\begin{lstlisting}
+profile netdiag-app flags=(attach_disconnected) {
+  # ... other rules ...
+  deny /var/run/docker.sock rwx,
+}
+\end{lstlisting}
+
+Loading and applying the profile:
+
+\begin{lstlisting}[language=bash]
+apparmor_parser -r -W netdiag-app.profile
+docker run --security-opt apparmor=netdiag-app netdiag
+\end{lstlisting}
+
+With this profile active, even UID 0 inside the container cannot open \texttt{docker.sock}. The LSM enforces the deny rule before the kernel honours the file permission check, making it independent of the \texttt{docker} group membership discussed in Section~11.7.
+
+The \texttt{--security-opt no-new-privileges} flag prevents SUID binaries inside the container from elevating privileges, blocking \texttt{su} and \texttt{sudo} even if they are present in the image:
+
+\begin{lstlisting}[language=bash]
+docker run --security-opt no-new-privileges netdiag
+\end{lstlisting}
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Layered hardening model: code fix, container configuration, kernel enforcement via seccomp and AppArmor}
+\end{figure}
+
+% ---
+
+\section{Network Segmentation}
+
+Network controls reduce the attacker's ability to establish and maintain a reverse shell even after achieving RCE. They do not prevent the docker.sock escape --- the socket uses \texttt{AF\_UNIX} IPC, not routed IP --- but they are effective against the reverse shell phase of the attack chain.
+
+Creating an internal network with no external gateway:
+
+\begin{lstlisting}[language=bash]
+docker network create --internal app-net
+docker run --network app-net netdiag
+\end{lstlisting}
+
+The \texttt{--internal} flag creates a network with no default gateway. Outbound TCP connections to external addresses fail at the kernel routing level. The reverse shell \texttt{connect()} call to the attacker's IP returns \texttt{ENETUNREACH}.
+
+iptables-based egress filtering as an alternative:
+
+\begin{lstlisting}[language=bash]
+iptables -I FORWARD \
+    -s 172.17.0.0/16 \
+    -d 192.168.98.0/24 \
+    -j DROP
+\end{lstlisting}
+
+This rule drops all forwarded packets from the container subnet to the attacker's LAN segment, blocking the reverse shell at the host firewall layer without changing the container's network configuration.
+
+Service isolation using separate networks in a Compose deployment:
+
+\begin{lstlisting}
+networks:
+  frontend:
+  backend:
+
+services:
+  app:
+    networks:
+      - frontend
+  db:
+    networks:
+      - backend
+\end{lstlisting}
+
+A compromised \texttt{app} container has no route to \texttt{db} because the two services share no network. Lateral movement between containers requires a network path that this configuration does not provide.
+
+Network segmentation is a containment control. It limits what an attacker can do after achieving RCE but does not address the root causes: the command injection vulnerability or the socket mount misconfiguration. It is most valuable as part of a layered defence where the primary vulnerabilities have also been addressed.

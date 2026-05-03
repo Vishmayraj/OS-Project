@@ -1,0 +1,179 @@
+\chapter{Threat Modeling}
+
+\section{STRIDE Analysis of the Lab Environment}
+
+STRIDE is a threat modeling framework developed at Microsoft that categorizes threats into six types: Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, and Elevation of Privilege. Applied to the lab environment, STRIDE provides a structured taxonomy for reasoning about which components are vulnerable to which threat categories and why.
+
+The components in scope are: the NetDiag Flask application, the Docker daemon (\texttt{dockerd}), the \texttt{docker.sock} Unix socket, the host operating system, and the container runtime.
+
+\begin{center}
+\begin{tabular}{p{1.8cm}p{3cm}p{2.5cm}p{5.5cm}}
+\hline
+\textbf{Threat} & \textbf{Definition} & \textbf{Component} & \textbf{Manifestation in Lab} \\
+\hline
+Spoofing & Impersonate another identity & Docker daemon & Attacker impersonates a legitimate Docker client via socket --- the API has no caller authentication \\
+Tampering & Modify data or code & Host filesystem & \texttt{echo pwned > /tmp/escaped.txt} writes to the host filesystem from inside a container \\
+Repudiation & Deny performing an action & Flask app & Default Flask dev server produces no structured access log --- injection requests leave no app-level record \\
+Information Disclosure & Expose data to unauthorized party & Container env, host FS & \texttt{docker inspect} exposes env-var secrets; \texttt{-v /:/hostfs} makes the entire host filesystem readable \\
+Denial of Service & Disrupt availability & Host resources & No cgroup limits on the container --- a fork bomb or memory exhaustion originating inside the container affects the host directly \\
+Elevation of Privilege & Gain unauthorized privilege & docker.sock $\rightarrow$ host root & Container UID 0 $\rightarrow$ socket API $\rightarrow$ privileged container spawn $\rightarrow$ host root operations \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Most Critical Threat: Elevation of Privilege}
+
+The entire attack chain is a privilege escalation sequence. The attacker begins as an anonymous HTTP client with no credentials and ends with the ability to write arbitrary files to the host filesystem and spawn privileged containers. Every intermediate step --- command injection, reverse shell, Docker CLI installation, escape container launch --- exists to advance this escalation. Elevation of Privilege is not one threat among several in this environment; it is the destination that all other threats serve.
+
+\subsection{Most Overlooked Threat: Repudiation}
+
+Flask's built-in development server does not produce structured access logs by default. The \texttt{WERKZEUG\_RUN\_MAIN} output that appears on the terminal is not persisted to a file and is not formatted for forensic query. An attacker who sends dozens of injection probes followed by a successful reverse shell leaves no application-layer record of those requests. The only log evidence available without additional instrumentation is at the network layer (\texttt{netstat}/\texttt{ss}) or the kernel layer (\texttt{auditd}). This makes post-incident attribution and timeline reconstruction significantly harder.
+
+\subsection{Per-Component STRIDE Breakdown}
+
+\textbf{NetDiag Flask application}:
+\begin{itemize}
+    \item Tampering: injected commands modify system state (files created, processes spawned).
+    \item Information Disclosure: command output is returned directly in the HTTP response body --- the attacker reads arbitrary command results via the browser.
+    \item Repudiation: no structured logging means injection activity cannot be proven from app records alone.
+    \item Elevation of Privilege: \texttt{os.popen()} executes as UID 0, granting the attacker root-equivalent execution immediately.
+\end{itemize}
+
+\textbf{Docker daemon (\texttt{dockerd})}:
+\begin{itemize}
+    \item Spoofing: the daemon socket accepts any HTTP-conformant request from a process with socket access --- there is no authentication of the caller.
+    \item Tampering: the API allows creating containers that modify the host (volume mounts, privileged mode, capability grants).
+    \item Elevation of Privilege: the daemon runs as UID 0 on the host. All API calls --- regardless of which process issued them --- execute with root privilege.
+\end{itemize}
+
+\textbf{\texttt{docker.sock}}:
+\begin{itemize}
+    \item Spoofing: any process that opens the socket is treated as a legitimate Docker client. File permissions are the only access control.
+    \item Elevation of Privilege: access to the socket is root-equivalent. No additional escalation step is needed once the socket is reachable.
+\end{itemize}
+
+\textbf{Host OS}:
+\begin{itemize}
+    \item Tampering: post-escape, the attacker can write to any path on the host filesystem.
+    \item Information Disclosure: the entire host filesystem becomes readable via the \texttt{-v /:/hostfs} volume mount used in the escape step.
+    \item Denial of Service: without cgroup resource limits, container processes compete for host CPU and memory with no throttle.
+\end{itemize}
+
+The STRIDE categories are not mutually exclusive in practice. During the attack chain, multiple threat categories trigger in sequence: Information Disclosure (command output returned in HTTP response) enables Elevation of Privilege (root shell), which enables Tampering (host file write) and further Information Disclosure (host filesystem readable via mount). The model is most useful as a checklist for ensuring no threat category is left unexamined, not as a strictly sequential framework.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{STRIDE threat mapping across lab components: Flask app, Docker daemon, docker.sock, and host OS}
+\end{figure}
+
+% ---
+
+\section{Attack Surface Mapping}
+
+The attack surface of a system is the set of points where an attacker can attempt to enter or extract data. Mapping the attack surface in this lab identifies where controls can be applied and where trust boundaries are crossed without enforcement.
+
+\subsection{Entry Points}
+
+\begin{itemize}
+    \item \texttt{http://192.168.98.4:5000/ping} --- an unauthenticated HTTP endpoint reachable from any host on the same network segment. This is the initial foothold.
+    \item \texttt{/var/run/docker.sock} --- a Unix socket reachable from inside the container because it is bind-mounted at the same path. This is the pivot point from container to host.
+    \item The Docker REST API --- accessible via the socket from any process that can open it. No network exposure is required; the API is fully reachable via the mounted socket.
+\end{itemize}
+
+\subsection{Trust Boundaries}
+
+Four trust boundaries exist in this environment, and each is either unenforced or insufficiently enforced:
+
+\begin{itemize}
+    \item \textbf{Network to Flask app}: no authentication, no TLS, no rate limiting. Any host on the network can make arbitrary requests.
+    \item \textbf{Flask app to OS shell}: \texttt{os.popen()} passes user-controlled input to \texttt{/bin/sh -c} without sanitization. The boundary between application code and OS execution is open.
+    \item \textbf{Container to host daemon}: the docker.sock bind-mount dissolves the container-host isolation boundary. A process inside the container can communicate with the host daemon as if it were a native host process.
+    \item \textbf{Docker API to host kernel}: the daemon executes all API requests as UID 0. There is no privilege separation between the API caller and root-level kernel operations.
+\end{itemize}
+
+\subsection{Data Flow with Trust Boundary Crossings}
+
+\begin{lstlisting}
+Attacker HTTP request
+  -> [Boundary: network to app, unenforced]
+  -> Flask view function
+  -> [Boundary: app to OS shell, unenforced via os.popen()]
+  -> /bin/sh as UID 0
+  -> [Boundary: container to host, dissolved via docker.sock mount]
+  -> dockerd REST API
+  -> [Boundary: API to kernel, all calls execute as root]
+  -> runc -> privileged container -> host filesystem
+\end{lstlisting}
+
+\subsection{Attack Surface Component Table}
+
+\begin{center}
+\begin{tabular}{p{3.5cm}p{3.5cm}p{5cm}}
+\hline
+\textbf{Surface} & \textbf{Exposure} & \textbf{Reduction Possible} \\
+\hline
+\texttt{/ping} endpoint & Full network (port 5000) & Authentication, input validation, subprocess fix \\
+\texttt{os.popen()} & Any HTTP client & Replace with \texttt{subprocess} list form \\
+\texttt{docker.sock} & Any UID 0 process in container & Remove bind-mount or use socket proxy \\
+Docker REST API & Any socket client & Socket proxy, rootless Docker \\
+Base image (\texttt{python:3.11-slim}) & Bash and apt-get present & Distroless base, non-root user \\
+Host filesystem & Readable via \texttt{-v /:/hostfs} post-escape & Rootless Docker, read-only mounts \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Minimal Attack Surface Configuration}
+
+With all mitigations from Chapter 11 applied simultaneously:
+
+\begin{itemize}
+    \item No docker.sock mount --- escape vector eliminated.
+    \item Non-root container user --- socket access denied by file permissions even if mount were present.
+    \item \texttt{subprocess} list form with input validation --- RCE eliminated at code level.
+    \item Read-only filesystem with \texttt{noexec tmpfs} --- tool installation and payload execution blocked.
+    \item Custom seccomp and AppArmor profiles --- socket access denied at kernel LSM layer.
+    \item Internal-only Docker network --- reverse shell TCP connection blocked at routing layer.
+\end{itemize}
+
+With this configuration, RCE remains theoretically possible if an injection vulnerability is reintroduced in future code, but lateral movement to the host is blocked at multiple independent layers.
+
+% ---
+
+\section{Risk Matrix}
+
+Risk is quantified as Likelihood $\times$ Impact, each scored on a scale of 1 to 5. Likelihood factors include exploitability, authentication requirements, and whether standard tooling is sufficient. Impact factors cover confidentiality, integrity, availability, and the blast radius of a successful exploitation.
+
+\begin{center}
+\begin{tabular}{p{4.5cm}p{1.5cm}p{1.5cm}p{1.5cm}p{2cm}}
+\hline
+\textbf{Risk} & \textbf{Likelihood} & \textbf{Impact} & \textbf{Score} & \textbf{Priority} \\
+\hline
+docker.sock escape to host root & 5 & 5 & 25 & Critical \\
+Command injection via \texttt{/ping} & 5 & 4 & 20 & Critical \\
+Secret exposure via \texttt{docker inspect} & 4 & 4 & 16 & High \\
+Persistence via host filesystem write & 3 & 5 & 15 & High \\
+No TLS on Docker API & 2 & 5 & 10 & Medium \\
+DoS via no cgroup limits & 3 & 4 & 12 & Medium \\
+Lateral movement to other containers & 3 & 4 & 12 & Medium \\
+Supply chain risk (unpinned base image) & 2 & 4 & 8 & Medium \\
+Repudiation (no structured logging) & 4 & 2 & 8 & Low-Medium \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Top Risk: docker.sock Escape (25/25)}
+
+The docker.sock escape scores the maximum possible risk value. Its likelihood is 5 because: the attack requires no unpatched CVE, no special tooling beyond standard Linux utilities, and no authentication to the Docker API. Its impact is 5 because successful exploitation grants full host root access --- arbitrary file read/write, ability to modify all containers on the host, and potential for persistent backdoor installation.
+
+This score does not represent a theoretical maximum; it represents a deterministic outcome. Given the two misconfigurations present in the lab environment, the escape is not probabilistic --- it is guaranteed if an attacker achieves the initial foothold.
+
+\subsection{Mitigation Impact on Top Risks}
+
+\begin{itemize}
+    \item Fixing \texttt{os.popen()} with \texttt{subprocess} list form drops the command injection likelihood from 5 to 1. Without code execution, the attacker cannot reach the socket regardless of whether it is mounted.
+    \item Removing the docker.sock mount drops the escape risk score from 25 to 0. The vector is eliminated rather than reduced.
+    \item Applying both mitigations simultaneously breaks the attack chain at two independent points. An attacker who bypasses the code fix (e.g., via a different injection vector) is still blocked by the absent socket mount. An attacker who somehow reaches the socket without RCE (e.g., via a separate container breakout) cannot escalate further without daemon access.
+\end{itemize}
+
+The risk matrix ordering also determines mitigation priority. Addressing the two Critical items provides more risk reduction than addressing all Medium items combined.

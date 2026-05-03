@@ -1,0 +1,300 @@
+\chapter{The Dockerfile and Container Configuration}
+
+This chapter documents the exact Dockerfile and \texttt{docker run} command used in the lab environment. Every decision -- the base image, the absence of a \texttt{USER} directive, the port binding, and the socket mount -- is intentional and carries a specific security consequence. This chapter bridges the application layer covered in Chapter 5 and the attack chain executed in Chapter 8.
+
+\section{Dockerfile Walkthrough Line by Line}
+
+The complete Dockerfile for the NetDiag application is:
+
+\begin{lstlisting}[language=docker]
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install flask
+EXPOSE 5000
+CMD ["python3", "app.py"]
+\end{lstlisting}
+
+Each instruction is analyzed below for its build-time and runtime security consequence.
+
+\begin{figure}[h]
+\centering
+\vspace{3.5cm}
+\caption{Dockerfile build stages mapped to image layers and runtime process state}
+\end{figure}
+
+\subsection*{\texttt{FROM python:3.11-slim}}
+
+This instruction sets the base image. \texttt{python:3.11-slim} is an official Docker Hub image based on \texttt{debian:bookworm-slim} (Debian 12 minimal) with Python 3.11 pre-installed. The \texttt{slim} variant strips development headers and most documentation but retains \texttt{apt-get}, \texttt{bash}, and \texttt{sh}.
+
+The critical security consequence of this line is one of omission: the base image defines no \texttt{USER} directive, so the default user inherited by every subsequent instruction and by the container's runtime process is \textbf{root (UID 0)}. Every layer built on top of this image inherits that default unless explicitly overridden.
+
+The image is pulled from Docker Hub at build time without a digest pin. Without pinning, the image resolved by \texttt{python:3.11-slim} can change between builds, introducing supply chain risk.
+
+\subsection*{\texttt{WORKDIR /app}}
+
+Creates the \texttt{/app} directory and sets it as the current working directory for all subsequent \texttt{RUN}, \texttt{COPY}, \texttt{CMD}, and \texttt{ENTRYPOINT} instructions, as well as for the container's runtime process. Because no \texttt{USER} has been set, this directory is created and owned by \texttt{root:root}. There is no direct security implication from this line alone.
+
+\subsection*{\texttt{COPY . .}}
+
+Copies the entire build context -- the contents of the \texttt{host/} directory -- into \texttt{/app} inside the image. Copied files inherit ownership \texttt{root:root (UID 0:GID 0)}. This includes \texttt{app.py} and any other files present in the build context at build time.
+
+The absence of a \texttt{.dockerignore} file means the build context is unrestricted. Any file present in \texttt{host/} -- including configuration files, \texttt{.env} files, private keys, or local credentials -- will be included in the image layer. This creates accidental secret inclusion risk that may not be immediately visible from inspecting the Dockerfile alone.
+
+\subsection*{\texttt{RUN pip install flask}}
+
+Executes during image build as \texttt{UID 0}. Installs Flask and its dependencies into the system Python installation rather than a virtualenv. This creates a new image layer containing the Flask packages. Because \texttt{pip} runs as root, packages are installed system-wide and accessible to any process running inside the container. The \texttt{--no-install-recommends} flag is absent, allowing \texttt{pip} and \texttt{apt} to pull in optional dependencies that expand the attack surface without contributing to application functionality.
+
+\subsection*{\texttt{EXPOSE 5000}}
+
+This instruction is documentation only. It writes metadata into the image manifest indicating the intended port but performs no kernel operation at build time or container start. It does not create a firewall rule, does not bind a socket, and does not publish the port to the host. Actual port binding requires the \texttt{-p} flag at \texttt{docker run} time, documented in Section~\ref{sec:dockerrun}. \texttt{EXPOSE} is used by \texttt{docker-compose}, \texttt{--publish-all}, and human operators as a signal of intent.
+
+\subsection*{\texttt{CMD ["python3", "app.py"]}}
+
+Defines the default command executed when the container starts. The exec form (JSON array) causes Docker to call \texttt{execve("python3", ["python3", "app.py"])} directly without a shell wrapper. The Python process becomes \textbf{container PID 1}.
+
+There are two security-relevant consequences. First, since no \texttt{USER} directive appears anywhere in the file, this process runs as \textbf{UID 0}. The Flask application, \texttt{os.popen()} calls, injected shell commands, and any child processes all inherit this UID. Second, as PID 1, the process receives signals directly from the kernel. There is no init process to absorb or handle \texttt{SIGTERM} or zombie processes from child process reaping. This has operational rather than direct security implications but is relevant to container behavior analysis.
+
+\subsection*{What Is Absent}
+
+The following hardening measures are absent from the Dockerfile. Each omission has a consequence that is exercised during the attack:
+
+\begin{itemize}
+    \item \textbf{No \texttt{USER} directive}: all processes run as \texttt{UID 0} by default. This is the single most consequential omission.
+    \item \textbf{No \texttt{.dockerignore}}: build context is unrestricted, risking accidental inclusion of secrets.
+    \item \textbf{No \texttt{--no-install-recommends}}: unnecessary packages are installed, expanding the available toolset inside the container.
+    \item \textbf{No multi-stage build}: build-time dependencies are present in the final runtime image.
+    \item \textbf{No \texttt{HEALTHCHECK}}: no liveness monitoring for the running application.
+    \item \textbf{No digest pin on base image}: the resolved image can change between builds.
+\end{itemize}
+
+\vspace{0.3cm}
+
+\section{Base Image Choice}
+
+\texttt{python:3.11-slim} is an official image maintained by the Python Docker community. It is based on \texttt{debian:bookworm-slim} and includes the Python 3.11 interpreter, \texttt{pip}, the standard library, and Debian base utilities. The \texttt{slim} label indicates that compiler toolchains, development headers, and documentation have been stripped relative to the full \texttt{python:3.11} image.
+
+\subsection*{Security-Relevant Contents}
+
+The \texttt{slim} label is frequently misread as equivalent to \texttt{minimal} or \texttt{secure}. Several components retained in the image are directly exploited in this attack:
+
+\begin{itemize}
+    \item \texttt{/bin/bash} and \texttt{/bin/sh} are present. This enables the bash TCP redirect reverse shell (\texttt{bash -i >\& /dev/tcp/...}) used in Step 2 of the attack chain.
+    \item \texttt{apt-get} is functional. This allows the attacker to install \texttt{docker.io} inside the container in Step 5 of the attack chain.
+    \item \texttt{python3} is present as an alternative shell primitive via \texttt{python3 -c 'import pty; pty.spawn("/bin/bash")'}, used for shell stabilization.
+    \item \texttt{curl} and \texttt{wget} are absent by default but are trivially installable via \texttt{apt-get}.
+\end{itemize}
+
+\subsection*{Image Size vs Attack Surface}
+
+The approximate image sizes for comparable Python base images are:
+
+\begin{itemize}
+    \item \texttt{python:3.11} (full): approximately 1~GB -- includes compilers, headers, manpages
+    \item \texttt{python:3.11-slim}: approximately 150~MB -- stripped but shell and package manager intact
+    \item \texttt{python:3.11-alpine}: approximately 50~MB -- \texttt{musl} libc, BusyBox \texttt{ash}, no \texttt{bash}
+    \item \texttt{gcr.io/distroless/python3}: no shell, no package manager, no \texttt{apt-get}
+\end{itemize}
+
+Alpine would make the reverse shell harder to execute (no \texttt{bash}, so the TCP redirect must be rewritten for \texttt{ash} or a compiled binary). Distroless would block both the reverse shell and the \texttt{apt-get install docker.io} step, forcing the attacker to use only the raw HTTP API via the socket. Neither alternative removes the vulnerability -- command injection and docker socket abuse would both remain exploitable through adjusted techniques.
+
+\subsection*{Supply Chain Consideration}
+
+The instruction \texttt{FROM python:3.11-slim} without a digest pin means the image tag is mutable. The image resolved at build time may differ from the image resolved at a later rebuild. To produce a reproducible and auditable image, the base should be pinned by digest:
+
+\begin{lstlisting}[language=docker]
+FROM python:3.11-slim@sha256:<digest>
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash]
+# Inspect base image available tools
+docker run --rm python:3.11-slim bash -c \
+  "which bash sh curl wget apt-get python3"
+
+# Inspect image layers
+docker history python:3.11-slim
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\section{Running as Root -- Why This Matters}
+
+The absence of any \texttt{USER} directive in the Dockerfile means every process inside the running container executes as \texttt{UID 0, GID 0}. This applies to the Flask process itself, the \texttt{os.popen()} subprocess, the injected shell commands, the reverse shell, and every child process spawned thereafter.
+
+\subsection*{UID 0 Without User Namespace Remapping}
+
+In the default Docker configuration, user namespace remapping is disabled. This means the UID-to-UID mapping is a direct identity map:
+
+\begin{lstlisting}[language=bash]
+# Inside the container
+cat /proc/self/uid_map
+# 0          0 4294967295
+\end{lstlisting}
+
+This output means UID 0 inside the container maps directly to UID 0 on the host kernel. There is no intermediate translation layer. Files written from inside the container appear as \texttt{root}-owned on the host filesystem. This is the default behavior and is what this lab demonstrates. Rootless Docker or \texttt{--userns-remap} would interpose a mapping, making UID 0 inside the container correspond to an unprivileged UID on the host.
+
+\subsection*{Attack Steps That Require Root}
+
+Table~\ref{tab:root_dependency} documents which steps in the attack chain are directly enabled by \texttt{UID 0}.
+
+\begin{table}[h]
+\centering
+\caption{Attack steps enabled by root execution context}
+\label{tab:root_dependency}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Attack Step} & \textbf{Why Root Is Required} \\
+\hline
+Read \texttt{/var/run/docker.sock} & Socket owner: \texttt{root:docker}, permissions \texttt{660} -- UID 0 passes \\
+\texttt{apt-get install docker.io} & Package installation requires root privileges \\
+\texttt{docker} CLI execution & Needs socket read/write -- granted to UID 0 \\
+Write \texttt{/tmp/escaped.txt} on host & File created as UID 0 -- root-owned on actual host \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection*{Effective Capability Set}
+
+A root process inside a default Docker container does not hold the full capability set of a root process on the host. Docker drops several capabilities by default. However, the retained set is sufficient for this attack. Relevant retained capabilities include:
+
+\begin{itemize}
+    \item \texttt{CAP\_CHOWN}: change file ownership
+    \item \texttt{CAP\_DAC\_OVERRIDE}: bypass file read, write, and execute permission checks regardless of file ownership
+    \item \texttt{CAP\_FOWNER}: bypass permission checks on operations that normally require matching file UID
+    \item \texttt{CAP\_SETUID} and \texttt{CAP\_SETGID}: change process UID/GID
+\end{itemize}
+
+\texttt{CAP\_DAC\_OVERRIDE} is particularly significant: it allows the root container process to read and write most files regardless of their ownership, which is what makes \texttt{docker.sock} accessible and what makes host filesystem writes succeed after the escape.
+
+The effective capability set can be inspected and decoded:
+
+\begin{lstlisting}[language=bash]
+# Confirm UID inside container
+docker exec netdiag-app id
+# uid=0(root) gid=0(root)
+
+# Confirm no UID remapping
+docker exec netdiag-app cat /proc/self/uid_map
+# 0          0 4294967295
+
+# Read effective capabilities
+docker exec netdiag-app cat /proc/self/status | grep CapEff
+
+# Decode the hex bitmask
+capsh --decode=$(docker exec netdiag-app \
+  cat /proc/self/status | grep CapEff | awk '{print $2}')
+\end{lstlisting}
+
+\subsection*{Non-Root as Partial Mitigation}
+
+Running the application as an unprivileged user (e.g., \texttt{UID 1001}) would block several steps in the attack chain. A non-root process cannot read \texttt{docker.sock} (owner \texttt{root}, group \texttt{docker}, permissions \texttt{660}) without group membership, cannot run \texttt{apt-get}, and cannot write to root-owned paths. However, this is a partial mitigation only. The command injection vulnerability in \texttt{app.py} exists independently of the process UID. An attacker would still achieve RCE -- they would simply be constrained to the privileges of the unprivileged user rather than root.
+
+\vspace{0.3cm}
+
+\section{Port Exposure}
+\label{sec:portexposure}
+
+\subsection*{\texttt{EXPOSE 5000} vs \texttt{-p 5000:5000}}
+
+Port exposure in Docker operates at two distinct levels that are frequently conflated.
+
+\texttt{EXPOSE 5000} in the Dockerfile is metadata. It records the intended port in the image manifest and is used by \texttt{docker-compose}, the \texttt{--publish-all} (\texttt{-P}) flag, and human operators as a convention signal. It performs no kernel operation at build time or container start, creates no firewall rule, and binds no socket. A container started without \texttt{-p} or \texttt{-P} has no port reachable from outside despite any \texttt{EXPOSE} declarations.
+
+\texttt{-p 5000:5000} in the \texttt{docker run} command is what actually exposes the service. When this flag is specified, the Docker daemon creates a set of iptables rules on the host:
+
+\begin{itemize}
+    \item \textbf{PREROUTING chain (DNAT)}: rewrites destination of packets arriving at \texttt{0.0.0.0:5000} to the container's IP (\texttt{172.17.0.X:5000})
+    \item \textbf{FORWARD chain}: permits forwarded traffic destined for the container subnet
+    \item \textbf{POSTROUTING chain}: MASQUERADE rule for container-to-external traffic
+\end{itemize}
+
+The host kernel does not bind a socket directly on port 5000. All traffic to that port is intercepted at the netfilter layer and redirected. Flask binds \texttt{0.0.0.0:5000} inside the container's network namespace and receives the redirected traffic.
+
+\subsection*{Security Implication}
+
+The default \texttt{-p 5000:5000} binds on \texttt{0.0.0.0}, making the service reachable from all host network interfaces. This includes the NAT network interface shared between VM1 and VM2, which is how the attacker at \texttt{192.168.98.5} reaches the Flask application. A binding restricted to localhost (\texttt{-p 127.0.0.1:5000:5000}) would limit access to processes on the host itself, though this is not applicable in a demonstration scenario that requires external access.
+
+\begin{lstlisting}[language=bash]
+# Verify iptables DNAT rule created by Docker
+iptables -t nat -L -n -v | grep -E "5000|172.17"
+
+# Confirm Flask binding inside container
+docker exec netdiag-app ss -tlnp
+# LISTEN  0  *:5000  -- Flask bound on all interfaces
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\section{The Intentional Misconfiguration in \texttt{docker run}}
+\label{sec:dockerrun}
+
+The complete \texttt{docker run} command from \texttt{setup.sh} is:
+
+\begin{lstlisting}[language=bash]
+docker run -d \
+    -p 5000:5000 \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --name netdiag-app \
+    netdiag
+\end{lstlisting}
+
+\begin{figure}[h]
+\centering
+\vspace{3.5cm}
+\caption{\texttt{docker run} flag map -- kernel operation and security consequence of each flag}
+\end{figure}
+
+\subsection*{Flag-by-Flag Analysis}
+
+\textbf{\texttt{-d} (detached mode).} The container runs in the background. Its stdout is not attached to the invoking terminal and it persists until explicitly stopped. No direct security implication.
+
+\textbf{\texttt{-p 5000:5000}.} Publishes the container's port 5000 to the host's port 5000. Creates iptables DNAT rules as described in Section~\ref{sec:portexposure}. This is the network entry point through which the attacker reaches the vulnerable Flask application.
+
+\textbf{\texttt{-v /var/run/docker.sock:/var/run/docker.sock} -- the critical flag.} This bind-mounts the host's Docker Unix domain socket into the container at the identical path. At the kernel level, the mount namespace of the container is modified so that the inode at \texttt{/var/run/docker.sock} inside the container is the same inode as \texttt{/var/run/docker.sock} on the host. It is not a copy, not a proxy, and not a restricted interface -- it is the live socket connected directly to the host Docker daemon.
+
+The socket retains its host permissions (\texttt{srw-rw---- root:docker}). The container process runs as \texttt{UID 0}, which passes the permission check without requiring \texttt{docker} group membership. No namespace boundary, seccomp rule, or AppArmor profile blocks socket access by default. From the moment the container starts, the root process inside it has full, unauthenticated administrative access to the host Docker daemon API.
+
+This single flag is the complete enabler of the container escape. Every step from Section 8.5 onward in the attack chain depends on it and on nothing else. The command injection vulnerability provides the execution channel; the socket mount provides the escape path. Neither requires a kernel exploit.
+
+\textbf{\texttt{--name netdiag-app}.} Assigns a human-readable name to the container for management purposes. Enables \texttt{docker inspect netdiag-app} in \texttt{detect.sh}. No security implication.
+
+\textbf{\texttt{netdiag} (image name).} References the locally built image. No registry pull occurs.
+
+\subsection*{Hardening Options Not Used}
+
+Table~\ref{tab:missing_flags} lists the \texttt{docker run} flags that would have partially or fully mitigated the escape, and what each would have done.
+
+\begin{table}[h]
+\centering
+\caption{Hardening flags absent from the \texttt{docker run} command}
+\label{tab:missing_flags}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Missing Flag} & \textbf{Effect If Present} \\
+\hline
+\texttt{--user 1001} & Run as non-root -- socket becomes unreadable, \texttt{apt-get} fails \\
+\texttt{--read-only} & Read-only root filesystem -- limits attacker persistence \\
+\texttt{--cap-drop=ALL} & Drop all Linux capabilities \\
+\texttt{--security-opt no-new-privileges} & Prevent privilege escalation via SUID binaries \\
+\texttt{--network} (scoped) & Restrict container network access \\
+Remove \texttt{-v docker.sock} & Eliminate the escape vector entirely \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection*{Why This Misconfiguration Is Realistic}
+
+The \texttt{-v /var/run/docker.sock:/var/run/docker.sock} pattern appears verbatim in the official setup documentation for Jenkins, Portainer, Watchtower, and numerous other container management tools. It is present in countless Stack Overflow answers, tutorials, and quick-start scripts. Operators commonly copy this flag without understanding that it grants root-equivalent access to the host. The configuration prioritises functional simplicity -- the container can manage other containers -- over the security boundary that containerization is assumed to provide.
+
+\subsection*{The Two-Vulnerability Combination}
+
+The attack requires both vulnerabilities to achieve full host compromise from a single HTTP request. Each vulnerability is serious independently:
+
+\begin{itemize}
+    \item \textbf{Vulnerability 1 -- Command injection in \texttt{app.py}}: unauthenticated RCE as root inside the container. CVSS v3 base score 9.8 Critical.
+    \item \textbf{Vulnerability 2 -- \texttt{docker.sock} bind mount}: any root process inside the container can instruct the host daemon to mount the host filesystem and execute arbitrary commands on it.
+\end{itemize}
+
+Together, they form a deterministic, single-request path from the public network to full host compromise. Neither requires a CVE. Neither requires a kernel exploit. Both are fixed by configuration changes alone: removing \texttt{os.popen()} unsanitized input, and removing the \texttt{-v docker.sock} flag.
+
+\vspace{0.5cm}

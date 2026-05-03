@@ -6,51 +6,86 @@
 \usepackage{float}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{url}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue,
+    citecolor=black
+}
 
 \lstset{
   basicstyle=\ttfamily\small,
   backgroundcolor=\color{gray!10},
   frame=single,
-  rulecolor=\color{black},
   breaklines=true,
-  tabsize=2,
-  showstringspaces=false,
-  keywordstyle=\color{blue}\bfseries,
-  commentstyle=\color{gray}\itshape,
-  stringstyle=\color{green!50!black},
   numbers=left,
   numberstyle=\tiny\color{gray},
-  xleftmargin=1em,
-  framexleftmargin=1em,
-  aboveskip=1.2em, 
-  belowskip=1.2em   
 }
 
 \geometry{margin=1in}
 
 \begin{document}
 
-\title{Docker Escape: Attack and Detection}
-\author{Zala Vishmayraj}
-\date{\today}
+\begin{titlepage}
+    \centering
 
-\maketitle
+    % Top spacing
+    \vspace*{2cm}
+
+    % Title
+    {\Huge \bfseries Docker Escape: Attack and Detection\par}
+    \vspace{1cm}
+
+    {\Large A Study on Container Security and Exploitation\par}
+
+    \vspace{2cm}
+
+    % Author block
+    {\large
+    \begin{tabular}{rl}
+        \textbf{Name:} & Zala Vishmayraj \\
+        \textbf{Enrollment No:} & 241370107071 \\
+        \textbf{Program:} & B.E. Computer Engineering \\
+        \textbf{Semester:} & 4th (C4) \\
+    \end{tabular}
+    }
+
+    \vspace{2cm}
+
+
+    \vfill
+
+    % Bottom section
+    {\large
+    Gujarat Technological University
+    }
+
+    \vspace{0.5cm}
+
+    {\large 23 April 2026}
+
+\end{titlepage}
+
 \tableofcontents
 \newpage
 
-% \input{chapters/ch1}
-% \input{chapters/ch2}
-% \input{chapters/ch3}
+\input{chapters/ch1}
+\input{chapters/ch2}
+\input{chapters/ch3}
 \input{chapters/ch4}
 \input{chapters/ch5}
-% \input{chapters/ch6}
-% \input{chapters/ch7}
-% \input{chapters/ch8}
-% \input{chapters/ch9}
-% \input{chapters/ch10}
-% \input{chapters/ch11}
-% \input{chapters/ch12}
-% \input{chapters/ch13}
+\input{chapters/ch6}
+\input{chapters/ch7}
+\input{chapters/ch8}
+\input{chapters/ch9}
+\input{chapters/ch10}
+\input{chapters/ch11}
+\input{chapters/ch12}
+\input{chapters/ch13}
+\input{chapters/ch14}
+\input{chapters/appendices}
 
 
 \end{document}

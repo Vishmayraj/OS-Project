@@ -1,0 +1,204 @@
+\chapter{Remote Code Execution (RCE)}
+
+\section{What is RCE}
+
+Remote Code Execution (RCE) refers to a class of vulnerability in which an attacker causes a target system to execute attacker-controlled commands without requiring authenticated access or physical presence. It is considered the highest-impact category of web vulnerability because it grants the attacker the same operational capabilities as the process running the target application.
+
+In this project, RCE is achieved through OS command injection in the NetDiag Flask application. The injected commands are executed by the Flask process itself, which runs as \texttt{UID 0} (root) inside a Docker container that has \texttt{/var/run/docker.sock} bind-mounted from the host. This combination elevates a single unauthenticated HTTP GET request into a full host compromise path.
+
+Two subtypes of RCE are commonly distinguished. Code injection exploits runtime evaluation constructs such as \texttt{eval()} to execute attacker-supplied code within the application's interpreter. OS command execution, which is the subtype relevant here, passes attacker-controlled input into a shell execution function, causing the operating system shell to run arbitrary commands. The distinction matters because the privileges obtained differ: code injection executes within the interpreter's sandbox, while OS command execution inherits the full process environment, UID, and filesystem access of the application.
+
+The severity ceiling of an RCE vulnerability depends entirely on the execution context. Here, the process context is \texttt{UID 0} inside a container with \texttt{docker.sock} accessible, making full host compromise possible. Per the CVSS v3 scoring framework, an unauthenticated RCE with no required interaction and high impact across confidentiality, integrity, and availability receives a base score of \textbf{9.8 (Critical)}.
+
+\vspace{0.3cm}
+
+\section{Command Injection as a Class of Vulnerability}
+
+Command injection is formally catalogued as \textbf{CWE-78: Improper Neutralization of Special Elements used in an OS Command}. It appears in the OWASP Top 10 under \textbf{A03:2021 -- Injection}, a category that encompasses all cases where untrusted data is sent to an interpreter as part of a command or query.
+
+Three necessary conditions must be simultaneously present for OS command injection to be exploitable. All three are present in NetDiag.
+
+\begin{itemize}
+    \item \textbf{User-controlled input reaches a shell execution function.} The \texttt{host} query parameter is read directly from the HTTP request and passed without any intermediate processing to \texttt{os.popen()}.
+    \item \textbf{No sanitization or validation is applied.} The application performs no allowlist checking, regex filtering, type coercion, or escaping on the input value before use.
+    \item \textbf{The function invokes a shell interpreter.} \texttt{os.popen()} passes its argument to \texttt{/bin/sh -c <string>}, meaning the full shell metacharacter set is available to an attacker.
+\end{itemize}
+
+Command injection is distinct from adjacent injection classes. SQL injection targets a database query parser and is constrained by SQL grammar. Code injection exploits \texttt{eval()}-style constructs and is bounded by the interpreter's capabilities. Server-Side Request Forgery (SSRF) controls a URL and targets network-reachable services. Path traversal manipulates filesystem paths. OS command injection uniquely grants direct shell access with the privileges of the target process.
+
+Two operational variants exist. In \textbf{blind injection}, the attacker cannot observe command output directly and must infer execution via timing side-channels or out-of-band DNS/HTTP callbacks. In \textbf{non-blind injection}, command output is reflected back in the HTTP response, as is the case in NetDiag. Non-blind injection dramatically accelerates exploitation because every curl request returns immediate, full output with no auxiliary infrastructure required.
+
+Python sink functions that introduce command injection risk include: \texttt{os.popen()}, \texttt{os.system()}, \texttt{subprocess.run(shell=True)}, and \texttt{subprocess.Popen(shell=True)}. All four pass the argument string to \texttt{/bin/sh -c} when the shell interface is used, making them equivalent from an attacker's perspective.
+
+\vspace{0.3cm}
+
+\section{The Injection Point in NetDiag}
+
+The vulnerable code in \texttt{app.py} is:
+
+\begin{lstlisting}[language=Python]
+host = request.args.get('host', '')
+result = os.popen("ping -c 3 " + host).read()
+\end{lstlisting}
+
+The data flow from HTTP request to shell execution proceeds as follows:
+
+\begin{lstlisting}
+GET /ping?host=<INPUT>
+  -> request.args.get('host')      # raw string, zero sanitization
+  -> "ping -c 3 " + host           # string concat, attacker controls tail
+  -> os.popen(<string>)            # passed to /bin/sh -c
+  -> shell interprets metacharacters
+\end{lstlisting}
+
+Flask uses the Werkzeug WSGI library for request parsing. Werkzeug performs URL-decoding before the value reaches the view function, meaning percent-encoded metacharacters are transparently decoded: \texttt{\%3B} becomes \texttt{;}, \texttt{\%26} becomes \texttt{\&}, and \texttt{\%7C} becomes \texttt{|}. An attacker can therefore submit shell metacharacters either as literal characters or as their percent-encoded equivalents and both will reach the shell unchanged.
+
+Because the input is appended by string concatenation to a fixed prefix, the attacker controls everything after \texttt{ping -c 3 }. Injected commands execute within the Flask process environment, inheriting its current working directory, all open file descriptors, environment variables, and critically, \texttt{UID 0}. No privilege escalation step is necessary because the application already runs as root.
+
+\vspace{0.3cm}
+
+\section{Shell Metacharacters -- How \texttt{;} Breaks the Command}
+
+When \texttt{os.popen()} is called with the string \texttt{ping -c 3 8.8.8.8;id}, the entire string is passed to \texttt{/bin/sh} as the argument to its \texttt{-c} flag. The shell must parse this string and determine the command structure before executing anything.
+
+The semicolon (\texttt{;}) is a POSIX-defined command separator. The shell splits the input at each \texttt{;} and executes the resulting commands sequentially, regardless of whether the preceding command succeeded or failed. The injection \texttt{8.8.8.8;id} therefore produces two commands:
+
+\begin{itemize}
+    \item \texttt{ping -c 3 8.8.8.8} -- executes normally, producing ping output
+    \item \texttt{id} -- executes unconditionally after ping completes, appending its output to the pipe
+\end{itemize}
+
+The full set of shell metacharacters available to an attacker is documented in Table~\ref{tab:metacharacters}.
+
+\begin{table}[h]
+\centering
+\caption{Shell Metacharacter Reference for Command Injection}
+\label{tab:metacharacters}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Character} & \textbf{Behavior} & \textbf{Payload Example} & \textbf{Condition} \\
+\hline
+\texttt{;} & Sequential separator & \texttt{8.8.8.8;id} & Unconditional \\
+\texttt{\&\&} & Logical AND & \texttt{8.8.8.8\&\&id} & Ping must succeed \\
+\texttt{||} & Logical OR & \texttt{INVALID||id} & Ping must fail \\
+\texttt{|} & Pipe & \texttt{8.8.8.8|wc} & Chains output \\
+\texttt{\textbackslash n} / \texttt{\%0A} & Newline separator & \texttt{8.8.8.8\%0Aid} & Same as \texttt{;} \\
+\texttt{\$()} & Command substitution & \texttt{\$(id)} & Nested execution \\
+\texttt{\&} & Background execution & \texttt{8.8.8.8\&id} & Concurrent \\
+\hline
+\end{tabular}
+\end{table}
+
+The semicolon is preferred in this attack for three reasons. First, it is unconditional -- the injected command runs regardless of whether \texttt{ping} succeeds. Second, it requires no quoting and introduces no ambiguity in the shell's parse. Third, its percent-encoded form \texttt{\%3B} is always decoded correctly by Werkzeug.
+
+It is worth noting that quoting the Python string concatenation would not prevent injection. Even if the developer wrote \texttt{"ping -c 3 '" + host + "'"}, an attacker could close the quote with a matching single-quote character in the payload and then inject freely. The only effective fix is to avoid shell interpretation entirely.
+
+\vspace{0.3cm}
+
+\section{Confirming Execution via \texttt{id}}
+
+The canonical first payload in OS command injection exploitation is the \texttt{id} command. It prints the UID, GID, and group memberships of the current process, takes no arguments, produces no side effects, and is present on every POSIX-compliant system.
+
+The confirmation request is:
+
+\begin{lstlisting}
+GET /ping?host=8.8.8.8%3Bid
+\end{lstlisting}
+
+A successful response body contains the ping output followed by:
+
+\begin{lstlisting}
+uid=0(root) gid=0(root) groups=0(root)
+\end{lstlisting}
+
+This output confirms three facts simultaneously: commands execute on the target OS and are not being sanitized or sandboxed; the process is running as \texttt{UID 0} (root); and full system access including package installation, socket operations, and filesystem writes is available without any further privilege escalation.
+
+The \texttt{attack.sh} automation script encodes this check as a precondition gate:
+
+\begin{lstlisting}[language=bash]
+RESPONSE=$(curl -s "${TARGET}/ping?host=8.8.8.8%3Bid")
+echo "$RESPONSE" | grep -q "uid=0" && echo "RCE confirmed"
+\end{lstlisting}
+
+Follow-up enumeration commands use the same injection vector to gather environment information:
+
+\begin{lstlisting}[language=bash]
+curl -s "http://192.168.98.4:5000/ping?host=8.8.8.8%3Buname+-a"
+curl -s "http://192.168.98.4:5000/ping?host=8.8.8.8%3Bls+-la+/var/run/docker.sock"
+\end{lstlisting}
+
+\vspace{0.3cm}
+
+\section{Why the Response Leaks to the Browser}
+
+NetDiag exhibits non-blind injection because the injected command output is reflected directly in the HTTP response body. Understanding this reflection path explains why no out-of-band infrastructure is needed and why every enumeration command returns immediate results.
+
+The output path from shell execution to HTTP response is:
+
+\begin{lstlisting}
+shell stdout -> pipe -> os.popen().read() -> Python string
+    -> render_template -> HTTP response body
+\end{lstlisting}
+
+At the system call level, \texttt{os.popen()} creates a \texttt{pipe()} before calling \texttt{fork()}. The child process, which becomes the shell, has its \texttt{stdout} redirected to the pipe's write end via \texttt{dup2()}. The parent process blocks on \texttt{read()} on the pipe's read end. When the shell exits, all output that was written to the pipe becomes available to the parent in a single \texttt{read()} call. Because all commands in a shell session share the same \texttt{stdout}, output from every injected command is captured.
+
+Flask passes the output string to Jinja2 via \texttt{render\_template}. Jinja2's \texttt{{{ result }}} syntax HTML-escapes special characters, which prevents XSS but passes plain text output through unmodified. The HTTP response code is always \texttt{200 OK} regardless of whether the injected command succeeded, failed, or produced an error.
+
+Standard error (\texttt{stderr}) is not captured by \texttt{os.popen()} by default. To capture error output alongside standard output, the attacker appends \texttt{2>\&1} to the payload:
+
+\begin{lstlisting}
+8.8.8.8;cat /root/.ssh/id_rsa 2>&1
+\end{lstlisting}
+
+The non-blind nature of this injection means the full attack chain can be executed using only \texttt{curl} with no timing attacks, DNS callbacks, or HTTP exfiltration channels.
+
+\vspace{0.3cm}
+
+\section{OS-Level View -- What Happens When the Shell Runs}
+
+This section traces the complete execution path from TCP packet arrival to HTTP response delivery for the request \texttt{GET /ping?host=8.8.8.8;id}.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{System call sequence from HTTP request to injected command output}
+\end{figure}
+
+\textbf{Step 1 -- Network ingress.} The TCP packet arrives at the host NIC. iptables DNAT rules forward port 5000 traffic to the container via a veth pair. The packet enters the container's network namespace and is delivered to Flask's \texttt{accept()} call, returning a socket file descriptor.
+
+\textbf{Step 2 -- HTTP parsing.} Werkzeug calls \texttt{recv()} on the socket, parses the HTTP request line and headers, URL-decodes the query string (\texttt{\%3B} becomes \texttt{;}), and routes the request to the \texttt{ping()} view function.
+
+\textbf{Step 3 -- \texttt{os.popen()} internals.}
+
+\begin{lstlisting}
+pipe()   -> [read_fd, write_fd]
+fork()   -> child PID (inherits UID 0, all file descriptors)
+child:   dup2(write_fd, STDOUT_FILENO)
+         execve("/bin/sh", ["-c", "ping -c 3 8.8.8.8;id"])
+parent:  close(write_fd)
+         read(read_fd, ...)   <- blocks here
+\end{lstlisting}
+
+\textbf{Step 4 -- Shell parsing and execution.} \texttt{/bin/sh} receives the string \texttt{ping -c 3 8.8.8.8;id} as its \texttt{-c} argument. The shell parses the \texttt{;} separator and executes two commands sequentially:
+
+\begin{lstlisting}
+fork() + execve("/bin/ping", ["-c","3","8.8.8.8"])  -> ping runs, exits
+fork() + execve("/usr/bin/id", ["id"])               -> id runs
+    output "uid=0(root)..." written to stdout (pipe write end)
+shell exits
+\end{lstlisting}
+
+\textbf{Step 5 -- Response assembly.} The parent process unblocks from \texttt{read()}, receives the complete output string, passes it to \texttt{render\_template}, and calls \texttt{send()} on the socket to deliver the HTTP response.
+
+The process tree on the host during execution is:
+
+\begin{lstlisting}
+python3 app.py     PID 847  UID 0   <- Flask, container PID 1
+  +-- /bin/sh -c   PID 848  UID 0   <- forked by os.popen
+      +-- ping     PID 849  UID 0   <- exits before id runs
+      +-- id       PID 850  UID 0   <- runs after ping
+\end{lstlisting}
+
+All PIDs exist within the container's PID namespace. The host sees the real underlying PIDs through \texttt{/proc}. No anomalous system calls are generated -- \texttt{fork()} and \texttt{execve()} are normal process operations. Detection of this attack requires process tree analysis and parent-child relationship monitoring rather than syscall blocking.
+
+\vspace{0.5cm}

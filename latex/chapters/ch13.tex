@@ -1,0 +1,189 @@
+\chapter{Comparison with Real-World Incidents}
+
+\section{Similar CVEs and Documented Escapes}
+
+The attack demonstrated in this project --- gaining host root from inside a container without any kernel exploit --- is not a contrived academic scenario. Variations of the same pattern appear across multiple documented CVEs and real-world incidents. The comparison below positions the lab's attack chain relative to these incidents, clarifying both the similarities and what distinguishes each case.
+
+\subsection{CVE-2019-5736 --- runc Container Escape}
+
+\textbf{Affected versions}: runc $<$ 1.0-rc6, Docker $<$ 18.09.2.
+
+The attacker requires root inside the container, which they have in the lab scenario via the command injection vulnerability. From that position, the attacker opens \texttt{/proc/self/exe} --- a symlink that, in the context of \texttt{docker exec}, resolves to the host's runc binary. By holding that file descriptor open and repeatedly overwriting the binary before execution completes, the attacker replaces the runc binary on the host with a payload. The next \texttt{docker exec} call on any container triggers the payload, executing arbitrary code as root on the host.
+
+The similarity to the lab is direct: root inside a container leads to host code execution. The mechanism is different. CVE-2019-5736 exploits a race condition in how runc resolves \texttt{/proc/self/exe} --- it is a kernel-level timing vulnerability that required coordinated disclosure and a patched runc release. The lab escape requires no race condition, no specific kernel version, and no CVE. It works on any default Docker installation with the socket mounted.
+
+The patch added file descriptor protections in runc that prevent the \texttt{/proc/self/exe} overwrite from succeeding, but this required changes to the container runtime itself.
+
+\subsection{CVE-2020-15257 --- containerd Shim API Exposure}
+
+\textbf{Affected versions}: containerd $<$ 1.3.9, containerd $<$ 1.4.3.
+
+The containerd shim process communicates with containers using an abstract Unix socket. Abstract sockets (those whose names begin with a null byte) are not bound to the filesystem --- they exist only in the kernel's abstract namespace and are accessible to any process that shares the same network namespace. Containers launched with \texttt{--network=host} share the host's network namespace, which includes access to abstract sockets. An attacker inside such a container can connect to the containerd shim API and use it to spawn a process on the host.
+
+The structural parallel to the lab is strong: an IPC channel (socket) that is accessible from inside the container leads to host daemon access, which enables privilege escalation. The difference is the precondition. CVE-2020-15257 requires \texttt{--network=host} and an unpatched containerd version. The lab requires only a docker.sock bind-mount, which is a far more common configuration than \texttt{--network=host} in production deployments.
+
+\subsection{CVE-2022-0492 --- cgroupv1 release\_agent Escape}
+
+\textbf{Affected versions}: Linux kernel $<$ 5.17 with cgroupv1 enabled.
+
+In cgroupv1, the \texttt{release\_agent} file specifies a program to execute when a cgroup becomes empty. If a container has \texttt{CAP\_DAC\_OVERRIDE} (which grants write access to files regardless of permission bits) and the host uses cgroupv1, an attacker can write a path to a controlled script into \texttt{release\_agent} and trigger it by causing a cgroup to empty. The kernel executes the \texttt{release\_agent} as root in the host namespace.
+
+This is a true kernel exploit: it depends on a specific kernel version range, a specific cgroup subsystem version, and a specific capability being present in the container. The lab escape has none of these dependencies. It is a misconfiguration exploit that works identically across kernel versions and requires no capability beyond UID 0 access to the mounted socket.
+
+\subsection{Tesla Kubernetes Cryptojacking (2018)}
+
+This incident was not caused by a CVE. The Tesla engineering team had deployed a Kubernetes cluster with the dashboard exposed to the internet with no authentication required. An attacker accessed the dashboard, retrieved secrets from Kubernetes pods --- including AWS IAM credentials stored in environment variables --- and used those credentials to provision EC2 instances for cryptocurrency mining.
+
+The parallel to the lab is structural rather than technical. In both cases, an unauthenticated control-plane API (Kubernetes dashboard in the Tesla incident, the Docker REST API via \texttt{docker.sock} in the lab) provides an attacker with full administrative access to the underlying infrastructure. Authentication on the control plane is the missing control in both cases. The Tesla incident demonstrates that this class of misconfiguration affects production systems at significant scale, not only lab environments.
+
+\subsection{Comparison Summary}
+
+\begin{center}
+\begin{tabular}{p{3.5cm}p{2cm}p{2cm}p{2.5cm}p{2.5cm}}
+\hline
+\textbf{Incident / CVE} & \textbf{Requires CVE} & \textbf{Auth Needed} & \textbf{Blast Radius} & \textbf{Similarity to Lab} \\
+\hline
+This lab & No & No & Full host & --- \\
+CVE-2019-5736 & Yes & No (root in container) & Full host & High \\
+CVE-2020-15257 & Yes & No & Host process exec & Medium \\
+CVE-2022-0492 & Yes & Partial (\texttt{CAP\_DAC\_OVERRIDE}) & Full host & Medium \\
+Tesla K8s breach & No & No & Full cloud account & High \\
+\hline
+\end{tabular}
+\end{center}
+
+The table makes one pattern clear: the most impactful incidents in this category do not require an unpatched CVE. The Tesla breach and the lab attack both achieve full compromise through configuration choices that were explicitly made by the teams deploying the systems. Defenders who focus exclusively on CVE patch cycles miss this entire class of threat.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Attack path comparison: lab escape vs CVE-2019-5736 vs CVE-2020-15257 vs Tesla K8s breach}
+\end{figure}
+
+% ---
+
+\section{Docker in CI/CD Pipelines --- Why This Pattern Is Common}
+
+The docker.sock bind-mount is not an exotic misconfiguration that only an inexperienced developer would introduce. It is a documented, widely recommended pattern in CI/CD tooling, which explains why it appears in production environments with regularity.
+
+\subsection{The CI/CD Requirement}
+
+A build pipeline that produces Docker images needs daemon access. Building an image requires \texttt{docker build}; pushing it to a registry requires \texttt{docker push}; deploying it requires \texttt{docker run}. When the pipeline agent itself runs inside a container --- as is standard in Jenkins, GitLab CI, and GitHub Actions self-hosted runners --- the agent needs a way to reach the Docker daemon.
+
+The most direct solution:
+
+\begin{lstlisting}[language=bash]
+docker run \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    jenkins/jenkins
+\end{lstlisting}
+
+The Jenkins agent running inside the container can now run \texttt{docker build} and \texttt{docker push} because it has access to the host daemon socket. The official Jenkins documentation describes this pattern. GitLab CI documentation offers the socket binding as an alternative to true Docker-in-Docker:
+
+\begin{lstlisting}
+variables:
+  DOCKER_HOST: unix:///var/run/docker.sock
+\end{lstlisting}
+
+The socket binding appears in official documentation for major CI platforms as a supported and, in some cases, recommended approach. Developers who follow official documentation to implement CI/CD Docker builds will produce this configuration without awareness that they are granting host root access to every build step.
+
+\subsection{Why Teams Accept the Risk}
+
+Several factors contribute to the pattern persisting in production:
+
+\begin{itemize}
+    \item \textbf{Official endorsement}: documentation from Docker, Jenkins, and GitLab presents socket binding as a standard pattern, not a security exception requiring justification.
+    \item \textbf{Perceived equivalence}: the alternative to socket binding is true Docker-in-Docker, which requires \texttt{--privileged} mode on the outer container. Both approaches are dangerous; teams frequently pick socket binding because it is simpler, without recognizing that both choices expose the host.
+    \item \textbf{Operational complexity of alternatives}: the socket proxy pattern (Section 11.2) requires maintaining an additional service with its own configuration. Under time pressure, teams skip it.
+    \item \textbf{Mental model mismatch}: developers see a volume mount (\texttt{-v}) and think of it as a file share. They do not recognize that mounting a Unix socket is different in kind from mounting a directory --- it grants the container the ability to issue commands to the host daemon as root.
+\end{itemize}
+
+\subsection{Blast Radius in the CI/CD Context}
+
+A compromised build step with docker.sock access has capabilities that extend well beyond the immediate host:
+
+\begin{itemize}
+    \item A malicious build step can modify other containers running on the same CI host, including containers belonging to other build jobs and other teams.
+    \item The build step can inject a malicious layer into the image being built. That layer is then distributed to every deployment environment that pulls the image. This is a supply chain attack: one compromised build produces poisoned artifacts that propagate downstream.
+    \item \texttt{docker inspect} on other running containers exposes environment variables. Build jobs for other services running on the same CI host may have database credentials, API keys, and service tokens in their environment --- all readable via the socket.
+\end{itemize}
+
+\subsection{Safer CI/CD Alternatives}
+
+Three alternatives eliminate the socket exposure in CI/CD:
+
+\begin{itemize}
+    \item \textbf{Kaniko}: builds Docker images from a Dockerfile without access to the Docker daemon. Runs as an unprivileged container; no socket required.
+    \item \textbf{Buildah}: a daemonless OCI image builder. Like Kaniko, it can produce container images without a running Docker daemon and without a socket bind-mount.
+    \item \textbf{Rootless Docker-in-Docker}: runs a nested Docker daemon as an unprivileged user using user namespaces. Removes the host socket from the picture; the inner daemon has no access to the outer host.
+\end{itemize}
+
+% ---
+
+\section{Cloud Metadata Abuse as a Related Vector}
+
+The lab demonstrates an escape from a container to the host operating system. In a cloud deployment, the same starting point --- container-level RCE --- can lead to a much broader compromise via the cloud metadata service. This section documents that extension.
+
+\subsection{The Cloud Metadata Service}
+
+Cloud providers make instance metadata available to any process running on a virtual machine via an HTTP endpoint at the link-local address \texttt{169.254.169.254}. This endpoint is reachable without credentials from any process on the VM --- including processes running inside containers, because Docker's default bridge network allows outbound connections to this address.
+
+The metadata service provides: IAM role credentials with associated access keys and session tokens, instance identity documents, network configuration, and user-data scripts passed at launch time.
+
+\subsection{AWS IMDSv1 --- Vulnerable}
+
+\begin{lstlisting}[language=bash]
+# From inside a container with outbound network access
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Returns: role name
+
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/<role-name>
+# Returns: AccessKeyId, SecretAccessKey, Token
+\end{lstlisting}
+
+These credentials have the permissions of the EC2 instance role. Depending on the IAM configuration, an attacker who retrieves them may be able to read from S3 buckets, describe EC2 instances, access RDS databases, invoke Lambda functions, or enumerate other cloud resources --- all from a single \texttt{curl} command inside the container.
+
+\subsection{Attack Extension from the Lab}
+
+The extension of the lab attack chain into a cloud environment proceeds as follows. First, the attacker achieves RCE via command injection inside the container. Second, the container has outbound network access through the default Docker bridge. Third, the attacker issues a \texttt{curl} request to \texttt{169.254.169.254} directly from the container --- no escape to the host is required for this step. Fourth, the metadata service returns the EC2 instance role credentials. Fifth, the attacker uses those credentials from any internet-connected machine to access cloud resources in the victim's AWS account.
+
+This means the docker.sock escape demonstrated in the lab is not even the most impactful attack available from the initial container RCE foothold in a cloud environment. The metadata service provides a direct path to cloud-wide lateral movement without requiring any host escape at all.
+
+\subsection{AWS IMDSv2 --- Mitigated}
+
+AWS IMDSv2 introduces a required PUT-before-GET flow:
+
+\begin{lstlisting}[language=bash]
+TOKEN=$(curl -s -X PUT \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+    http://169.254.169.254/latest/api/token)
+
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/iam/security-credentials/
+\end{lstlisting}
+
+The PUT request to obtain a token cannot be executed via Server-Side Request Forgery (SSRF) in most configurations because SSRF attacks typically cannot follow redirects or send custom HTTP methods. A simple \texttt{curl} inside a container can still complete the two-step flow, but the TTL-bound token limits the window of credential use.
+
+IMDSv2 enforcement is a configuration choice. Instances must be explicitly set to require IMDSv2; instances created with older configurations or infrastructure-as-code templates may still use IMDSv1.
+
+\subsection{Other Cloud Providers}
+
+GCP exposes metadata at \texttt{http://metadata.google.internal/computeMetadata/v1/} and requires a \texttt{Metadata-Flavor: Google} header, which prevents simple browser-based SSRF but does not prevent access from inside a container with a direct network path. Azure's Instance Metadata Service at \texttt{http://169.254.169.254/metadata/instance} requires a \texttt{Metadata: true} header and uses IMDSv2-equivalent token flows.
+
+\subsection{Mitigations}
+
+\begin{itemize}
+    \item Enforce IMDSv2 on all EC2 instances via instance metadata options or a Service Control Policy.
+    \item Block container access to the metadata service using iptables rules that drop packets from the container subnet destined for \texttt{169.254.169.254}:
+\end{itemize}
+
+\begin{lstlisting}[language=bash]
+iptables -I DOCKER-USER \
+    -s 172.17.0.0/16 \
+    -d 169.254.169.254 \
+    -j DROP
+\end{lstlisting}
+
+\begin{itemize}
+    \item Apply the principle of least privilege to EC2 instance roles --- roles should have only the permissions the instance itself needs, not the permissions of the workloads running on it.
+\end{itemize}

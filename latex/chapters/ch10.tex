@@ -1,0 +1,316 @@
+\chapter{Detection Techniques}
+
+\section{Host-Based Indicators of Compromise}
+
+After the attack chain executes, several categories of forensic evidence remain on the host. These indicators exist regardless of whether \texttt{detect.sh} has been run. Knowing where to look and what constitutes an anomaly is the prerequisite for any reactive investigation.
+
+\textbf{Filesystem artifacts:}
+\begin{itemize}
+    \item \texttt{/tmp/escaped.txt}: the direct escape artifact --- a file written to the host filesystem by a process that originated inside a container. Owned by root, present on the host, and absent from any container layer.
+    \item New files in \texttt{/root/.ssh/}, \texttt{/etc/cron.d/}, or \texttt{/etc/passwd} if the attacker escalated further after the escape.
+    \item New Docker images: \texttt{docker images} will show \texttt{alpine} pulled by the escape step, which was not present in the original image inventory.
+    \item Stopped containers in \texttt{docker ps -a}: the escape container launched with \texttt{--rm} in this scenario, so it self-removes after exit. Without \texttt{--rm}, a stopped alpine container would remain as a persistent artifact.
+\end{itemize}
+
+\textbf{Process artifacts:}
+\begin{itemize}
+    \item An unexpected parent-child process chain: \texttt{python3} (the Flask worker) with a \texttt{bash} child that has no associated TTY. This is visible in \texttt{ps aux} and \texttt{pstree}.
+    \item A \texttt{bash} process whose command line contains \texttt{/dev/tcp}: \texttt{cat /proc/<pid>/cmdline} on the suspicious PID will reveal the Bash TCP redirect syntax used to open the reverse shell.
+    \item \texttt{apt-get} execution inside the container: visible in container process history and potentially in \texttt{/var/log/dpkg.log} if the container's filesystem is inspected.
+\end{itemize}
+
+\textbf{Network artifacts:}
+\begin{itemize}
+    \item An outbound TCP connection from a container IP in the \texttt{172.17.0.0/16} range to the attacker IP on port 4444. This is visible in \texttt{netstat -an} or \texttt{ss -an} during an active reverse shell session.
+    \item The connection appears as the container's IP (Docker applies NAT at the host bridge), so the source address in \texttt{netstat} is the container's \texttt{docker0} address, not the host's external IP.
+\end{itemize}
+
+\textbf{Log artifacts:}
+\begin{itemize}
+    \item The Flask access log records every request, including \texttt{GET /ping?host=8.8.8.8\%3Bid} --- the URL-encoded semicolon is preserved verbatim in the log and is a clear injection indicator.
+    \item The Docker daemon log records container creation events and image pulls, including the alpine pull initiated from inside the container via the daemon socket.
+    \item If \texttt{auditd} was running before the attack, \texttt{/var/log/audit/audit.log} contains timestamped records of every process that opened \texttt{/var/run/docker.sock}, including the attacker's docker CLI invocation from inside the container.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Host artifact map: filesystem, process, network, and log IOCs left by the attack chain}
+\end{figure}
+
+% ---
+
+\section{docker inspect for Mount Auditing}
+
+\texttt{docker inspect} is the primary tool for auditing container configuration. It reads directly from daemon state and returns the complete JSON record for any container, including the \texttt{Mounts} array that exposes every bind mount and the \texttt{HostConfig} object that records the flags passed at container creation time. Importantly, it works post-incident without requiring the container to be in a running state.
+
+Extracting bind mounts for a specific container:
+
+\begin{lstlisting}[language=bash]
+docker inspect netdiag-app | \
+    python3 -c "import sys, json; \
+    [print(m['Source'], '->', m['Destination']) \
+    for m in json.load(sys.stdin)[0]['Mounts']]"
+\end{lstlisting}
+
+Mount patterns that should be treated as critical findings:
+\begin{itemize}
+    \item \texttt{/var/run/docker.sock} bound to any destination inside the container --- direct daemon access.
+    \item \texttt{/} or \texttt{/etc} or \texttt{/root} bound into the container --- host root or configuration exposure.
+    \item \texttt{/proc} mounted into the container --- host process namespace visibility.
+\end{itemize}
+
+Auditing all running containers at once:
+
+\begin{lstlisting}[language=bash]
+docker ps -q | xargs -I{} docker inspect {} | \
+    python3 -c "
+import sys, json
+for c in json.load(sys.stdin):
+    for m in c.get('Mounts', []):
+        if 'docker.sock' in m.get('Source', ''):
+            print('ALERT:', c['Name'], m['Source'])
+"
+\end{lstlisting}
+
+Beyond mount configuration, \texttt{HostConfig.Privileged} and \texttt{HostConfig.CapAdd} are equally important fields to check:
+
+\begin{lstlisting}[language=bash]
+docker inspect netdiag-app | python3 -c \
+    "import sys, json; \
+    h = json.load(sys.stdin)[0]['HostConfig']; \
+    print('Privileged:', h['Privileged']); \
+    print('CapAdd:', h['CapAdd'])"
+\end{lstlisting}
+
+A container with \texttt{Privileged: true} has full host capability access --- equivalent in danger to a \texttt{docker.sock} mount. \texttt{CapAdd} entries such as \texttt{CAP\_SYS\_ADMIN} or \texttt{CAP\_NET\_ADMIN} indicate elevated capability grants that may enable escape paths outside the socket vector.
+
+This audit should be integrated into the CI/CD pipeline. Every container deployment should trigger an inspect audit; a pipeline step that finds a \texttt{docker.sock} mount or \texttt{Privileged: true} should fail the deployment before the container reaches production.
+
+% ---
+
+\section{auditd --- Architecture and Rule System}
+
+\texttt{auditd} is a Linux kernel subsystem paired with a userspace daemon. It provides tamper-resistant logging of filesystem access, syscall execution, and user authentication events. Its value in the Docker socket context is that it operates entirely on the host and is transparent to container namespace boundaries --- it sees all container processes by their host PIDs and logs their activity against host filesystem paths.
+
+\subsection{Architecture}
+
+\texttt{auditd} consists of three components working together:
+
+\begin{itemize}
+    \item The \textbf{kernel audit subsystem}, compiled into the Linux kernel, intercepts system calls and filesystem operations that match registered rules. It writes event records to an in-kernel buffer.
+    \item The \textbf{\texttt{auditd} daemon} in userspace reads from the kernel buffer via a \texttt{netlink} socket and appends records to \texttt{/var/log/audit/audit.log}. The log is append-only and readable only by root.
+    \item \textbf{\texttt{auditctl}} is the rule management utility. It adds, removes, and lists rules at runtime. Changes made with \texttt{auditctl} are active immediately but do not survive a reboot unless written to \texttt{/etc/audit/rules.d/}.
+\end{itemize}
+
+\subsection{Rule Types}
+
+Three categories of rules are relevant:
+
+\begin{itemize}
+    \item \textbf{File watch rules} (\texttt{-w}): monitor a specific file or directory path for a set of access types. Applicable access type flags are \texttt{r} (read), \texttt{w} (write), \texttt{x} (execute), and \texttt{a} (attribute change).
+    \item \textbf{Syscall rules} (\texttt{-a}): trigger on a specific system call, optionally filtered by UID, PID, or architecture.
+    \item \textbf{Control rules} (\texttt{-e}): enable or disable the audit system globally.
+\end{itemize}
+
+\subsection{File Watch Rule for docker.sock}
+
+The rule deployed in \texttt{detect.sh}:
+
+\begin{lstlisting}[language=bash]
+auditctl -w /var/run/docker.sock -p rwxa -k docker_sock
+\end{lstlisting}
+
+When active, the kernel notifies \texttt{auditd} on every \texttt{open()}, \texttt{read()}, \texttt{write()}, and \texttt{connect()} system call that touches the socket path. Each event generates a log record containing the timestamp, PID, UID, process name, full executable path, syscall number, and result.
+
+Persistent rule file to survive reboots:
+
+\begin{lstlisting}
+# /etc/audit/rules.d/docker.sock.rules
+-w /var/run/docker.sock -p rwxa -k docker_sock
+\end{lstlisting}
+
+Log rotation is managed by \texttt{auditd.conf} via the \texttt{max\_log\_file} and \texttt{max\_log\_file\_action} directives. Performance impact for a file watch on \texttt{/var/run/docker.sock} is negligible --- the socket is accessed infrequently relative to high-volume paths such as \texttt{/tmp} or \texttt{/proc}.
+
+The critical limitation in a reactive deployment: \texttt{auditd} does not log retroactively. If the attack runs before the rule is established, there are no records of those accesses. This is the primary argument for deploying \texttt{auditd} rules as part of host provisioning, not as a response to an incident.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{auditd architecture: kernel audit subsystem, netlink socket, userspace daemon, and log pipeline}
+\end{figure}
+
+% ---
+
+\section{ausearch and Log Interpretation}
+
+\texttt{ausearch} is the query tool for \texttt{/var/log/audit/audit.log}. It supports filtering by key, PID, user, time range, and several other fields, making it significantly more practical than grepping the raw log file.
+
+Basic queries for the docker socket key:
+
+\begin{lstlisting}[language=bash]
+ausearch -k docker_sock
+ausearch -k docker_sock --start today
+ausearch -k docker_sock -p <pid>
+\end{lstlisting}
+
+\subsection{Log Record Structure}
+
+Each file access event generates a group of three related record types written sequentially to the log:
+
+\begin{lstlisting}
+type=SYSCALL ... pid=1234 uid=0 comm="docker" exe="/usr/bin/docker"
+type=PATH ... name="/var/run/docker.sock" nametype=NORMAL
+type=PROCTITLE proctitle=646F636B6572...
+\end{lstlisting}
+
+\begin{itemize}
+    \item The \texttt{SYSCALL} record captures the syscall number, PID, UID, binary name (\texttt{comm}), full executable path (\texttt{exe}), and whether the call succeeded (\texttt{success=yes/no}).
+    \item The \texttt{PATH} record captures the filesystem path that was accessed and its type (\texttt{NORMAL}, \texttt{CREATE}, \texttt{DELETE}).
+    \item The \texttt{PROCTITLE} record contains the full command line of the triggering process, hex-encoded. This encoding prevents log injection via crafted command line strings.
+\end{itemize}
+
+Decoding the \texttt{PROCTITLE} hex:
+
+\begin{lstlisting}[language=bash]
+ausearch -k docker_sock | grep PROCTITLE | \
+    sed 's/.*proctitle=//; s/../\\x&/g' | xargs -0 printf
+\end{lstlisting}
+
+\subsection{Key Fields and Suspicious Patterns}
+
+The fields most relevant to this attack:
+
+\begin{itemize}
+    \item \texttt{pid}: which process accessed the socket.
+    \item \texttt{uid}: UID 0 from a process whose \texttt{exe} path is not \texttt{/usr/bin/dockerd} is the primary suspicious pattern.
+    \item \texttt{comm}: the binary name. \texttt{docker} appearing as \texttt{comm} with a parent PID that maps to a container namespace is an anomaly.
+    \item \texttt{exe}: the full executable path. An unexpected path such as one under \texttt{/tmp} or inside an overlay filesystem layer would indicate a staged binary.
+    \item \texttt{success}: a failed access (success=no) may indicate a probing attempt that was blocked by file permissions.
+\end{itemize}
+
+\texttt{aureport} can generate a file access summary report that is more compact than raw \texttt{ausearch} output:
+
+\begin{lstlisting}[language=bash]
+aureport -f | grep docker.sock
+\end{lstlisting}
+
+% ---
+
+\section{lsof for Live Process Inspection}
+
+\texttt{lsof} (list open files) reports which processes currently have a file descriptor referencing a given path. It reads \texttt{/proc/*/fd/} symlinks and does not require a kernel module or elevated configuration.
+
+\begin{lstlisting}[language=bash]
+lsof /var/run/docker.sock
+\end{lstlisting}
+
+The output format:
+
+\begin{lstlisting}
+COMMAND   PID  USER   FD   TYPE   DEVICE SIZE/OFF NODE NAME
+dockerd   412  root   11u  unix   ...              ...  docker.sock
+docker   8823  root    5u  unix   ...              ...  docker.sock
+\end{lstlisting}
+
+The first row is expected: \texttt{dockerd} holds the socket open as the owning daemon. The second row --- a \texttt{docker} process that is not the daemon --- is suspicious, particularly if its PID maps to a process inside a container.
+
+Tracing the parent chain of a suspicious PID:
+
+\begin{lstlisting}[language=bash]
+ps -o pid,ppid,cmd --pid <suspicious_pid>
+cat /proc/<suspicious_pid>/status | grep PPid
+\end{lstlisting}
+
+Determining whether a PID originated inside a container:
+
+\begin{lstlisting}[language=bash]
+cat /proc/<pid>/cgroup | grep docker
+\end{lstlisting}
+
+If the \texttt{cgroup} entry contains a Docker container ID, the process is running inside a container but is visible on the host because \texttt{auditd} and \texttt{lsof} operate in the host's PID namespace.
+
+\texttt{lsof} and \texttt{auditd} serve different temporal roles. \texttt{lsof} is a live snapshot; it captures who holds the socket open at the moment of execution. If an attacker opens and closes the socket quickly, a single \texttt{lsof} invocation may miss the access entirely. \texttt{auditd} covers this gap by logging every access event continuously regardless of when the query is run.
+
+% ---
+
+\section{Falco --- Rule-Based Runtime Detection}
+
+Falco is a CNCF runtime security tool that monitors kernel events via an eBPF probe or a kernel module. It operates as a continuous detection engine rather than an on-demand audit tool. While Falco is not installed in this demonstration environment, it represents the correct detection layer for production deployments.
+
+\subsection{Architecture}
+
+Falco hooks into kernel system call events using eBPF. Every syscall that any process on the host generates passes through the eBPF probe. Falco evaluates each event against a ruleset expressed in YAML. When an event matches a rule condition, Falco emits an alert with configurable outputs (syslog, JSON, Slack webhook, and others).
+
+The eBPF approach has low overhead and does not require modifying the kernel or loading an unsigned module. Falco is namespace-transparent --- it sees all container syscalls from the host perspective.
+
+\subsection{Built-in Rules Relevant to This Attack}
+
+\begin{center}
+\begin{tabular}{p{4.5cm}p{4cm}p{4.5cm}}
+\hline
+\textbf{Rule} & \textbf{Trigger} & \textbf{Catches} \\
+\hline
+Sensitive Mount in Container & Container started with sensitive path mounted & \texttt{-v /var/run/docker.sock} at setup time \\
+Container with docker.sock Mount & docker.sock visible in container mounts & Same --- at container start \\
+Netcat Remote Code Execution in Container & \texttt{nc} with \texttt{-e} or \texttt{-c} flag & Reverse shell variants \\
+Shell Spawned in Container & Unexpected \texttt{bash}/\texttt{sh} as child of non-shell process & Reverse shell spawned from Flask \\
+Write Below Root & Container writes to host-mounted root path & Escape artifact write \\
+\hline
+\end{tabular}
+\end{center}
+
+Example Falco alert for the mount misconfiguration:
+
+\begin{lstlisting}
+Warning Sensitive mount by container
+  (user=root container=netdiag-app
+   mounts=/var/run/docker.sock:/var/run/docker.sock)
+\end{lstlisting}
+
+Falco fires the mount rules at container start --- before any exploitation attempt. This means the misconfiguration is detected at the moment the container is launched by \texttt{setup.sh}, not after the attacker has already acted.
+
+\subsection{Custom Rule for This Scenario}
+
+\begin{lstlisting}
+- rule: Docker Socket Access from Container
+  desc: Process inside container accessing docker.sock
+  condition: >
+    container and
+    fd.name = /var/run/docker.sock and
+    not proc.name = dockerd
+  output: >
+    docker.sock accessed from container
+    (proc=%proc.name pid=%proc.pid)
+  priority: CRITICAL
+\end{lstlisting}
+
+This rule fires any time a process inside a container opens \texttt{/var/run/docker.sock} and that process is not \texttt{dockerd} itself. It is a narrowly scoped rule that generates no false positives in a correct deployment.
+
+% ---
+
+\section{Building a Detection Checklist}
+
+The checks described in this chapter divide into two operational contexts: proactive controls that run continuously before any attack occurs, and reactive checks that are run after a suspected incident to assess the extent of compromise.
+
+\subsection{Proactive Controls}
+
+\begin{itemize}
+    \item Run \texttt{docker inspect} against all containers at deployment time. Flag any container with a \texttt{docker.sock} mount, \texttt{Privileged: true}, or a dangerous \texttt{CapAdd} entry. Fail the CI/CD pipeline on a positive result.
+    \item Deploy Falco with the default ruleset on all Docker hosts. Alert on sensitive mounts at container start, before any exploitation is possible.
+    \item Set the \texttt{auditctl} file watch rule on \texttt{/var/run/docker.sock} during host provisioning. Write the rule to \texttt{/etc/audit/rules.d/} to survive reboots.
+    \item Review \texttt{docker-compose.yml} files and \texttt{docker run} commands in source control for \texttt{-v /var/run/docker.sock} patterns.
+    \item Enforce image scanning with tools such as Trivy or Grype. Flag base images that include a shell and package manager, as both are required for the attacker to install the Docker CLI after gaining RCE.
+\end{itemize}
+
+\subsection{Reactive Checks}
+
+\begin{itemize}
+    \item Check \texttt{/tmp/}, \texttt{/root/.ssh/}, and \texttt{/etc/cron.d/} for unexpected files. Owner, permissions, and modification time are all relevant.
+    \item Run \texttt{docker ps -a} and \texttt{docker images}. Short-lived alpine or busybox containers and unexpected image pulls are indicators of escape activity.
+    \item Run \texttt{ausearch -k docker\_sock --start today} to identify all processes that touched the daemon socket since the rule was established.
+    \item Run \texttt{lsof /var/run/docker.sock} to check for active non-daemon connections.
+    \item Inspect the Flask or application access logs for URL-encoded shell metacharacters: \texttt{\%3B} (semicolon), \texttt{\%26} (ampersand), \texttt{\%7C} (pipe).
+    \item Run \texttt{netstat -an} or \texttt{ss -an} and look for established outbound TCP connections from the container subnet (\texttt{172.17.0.x}) to external addresses on unexpected ports.
+    \item Run \texttt{ps aux} for suspicious parent-child chains, then use \texttt{cat /proc/<pid>/cgroup} to confirm whether a suspicious process originated inside a container.
+\end{itemize}

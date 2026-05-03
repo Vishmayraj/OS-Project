@@ -1,0 +1,88 @@
+\chapter{Conclusion}
+
+\section{What Was Demonstrated}
+
+This project demonstrated a complete, end-to-end container escape chain using two misconfigurations that are present in real-world deployments. No kernel exploit was used. No CVE was triggered. No tooling beyond standard Linux utilities was required.
+
+The chain rested on two independent vulnerabilities. The first was an OS command injection flaw (CWE-78): the \texttt{/ping} route passed the user-supplied \texttt{host} parameter directly to \texttt{os.popen()}, which invoked \texttt{/bin/sh -c} with the concatenated string. The semicolon in \texttt{8.8.8.8;id} was decoded by Flask from its URL-encoded form and interpreted by the shell as a command separator, resulting in \texttt{id} executing as UID 0 inside the container. The second was Docker socket exposure: the \texttt{-v /var/run/docker.sock:/var/run/docker.sock} bind-mount gave any process inside the container direct access to the host Docker daemon API with no authentication.
+
+The attack steps executed in sequence were as follows. RCE was confirmed by observing \texttt{uid=0(root)} in the HTTP response to \texttt{/ping?host=8.8.8.8;id}. A reverse Bash TCP shell was delivered via a URL-encoded payload, establishing an interactive session as root inside the container on the attacker's listener. The container was enumerated and the Docker socket confirmed present and accessible via \texttt{ls -la /var/run/docker.sock}. The Docker CLI was installed inside the container using \texttt{apt-get}. A new privileged container was spawned via the host daemon with \texttt{-v /:/hostfs}, making the entire host filesystem available inside the escape container. The command \texttt{chroot /hostfs sh -c 'echo pwned > /tmp/escaped.txt'} wrote a file to the real host filesystem, confirming complete host compromise.
+
+Detection was demonstrated immediately after. The escape artifact at \texttt{/tmp/escaped.txt} was found on the host. \texttt{docker inspect} on the running container revealed the \texttt{docker.sock} bind-mount in the \texttt{Mounts} array. An \texttt{auditd} file watch rule was established on the socket path for future access logging. \texttt{lsof} confirmed active socket connections from non-daemon processes.
+
+The entire chain is reproducible on any default Docker installation where both misconfigurations are present. The reproducibility is the point: this is not an edge case or a race condition. It is a deterministic consequence of two specific configuration choices.
+
+% ---
+
+\section{Key Takeaways}
+
+\subsection{Misconfiguration Outpaces CVEs as a Practical Threat}
+
+The escape chain required zero unpatched vulnerabilities. Both enabling conditions --- the command injection and the socket mount --- were introduced by explicit configuration choices, not by software defects outside the deployer's control. The real-world incidents in Chapter 13 confirm that this pattern generalises: the Tesla Kubernetes breach and the Docker Hub poisoned images incident were both misconfiguration exploits, not CVE exploits. Security posture that focuses exclusively on patch cycles misses this entire attack class. Auditing configuration is as important as applying patches.
+
+\subsection{A Container Is Not a Security Boundary by Default}
+
+Linux namespaces provide isolation of visibility: a containerised process cannot see host processes, host filesystems, or host network interfaces unless those resources are explicitly shared. Namespaces do not provide isolation of privilege. A container running as UID 0 with access to the Docker socket is not contained --- it has a direct path to host root via the daemon API. The mental model of ``running in Docker'' as a security guarantee is incorrect without explicit hardening. Containerisation is an operational tool; security requires treating it as one layer in a defence-in-depth stack, not as a boundary.
+
+\subsection{Defence-in-Depth Is Not Optional}
+
+Fixing the code eliminates RCE but leaves the socket mount as a standing misconfiguration accessible to any future vulnerability in the application. Removing the socket mount eliminates the escape but leaves the application exploitable for RCE that is contained within the container. Both fixes together break the chain at two independent points. The full hardening posture from Chapter 11 --- code fix, socket removal, non-root container user, seccomp profile, AppArmor profile, read-only filesystem, and network controls --- provides redundant layers such that no single future mistake re-enables the full chain.
+
+\subsection{Root Inside Containers Is Dangerous}
+
+UID 0 without user namespace remapping is UID 0 on the host kernel. Capabilities, filesystem access, and network operations available to root inside the container are host-level operations constrained only by what the container runtime explicitly restricts. The \texttt{USER} directive in a Dockerfile is a security control, not an aesthetic choice. Default Docker images run as root; explicit non-root configuration is required. The non-root user fix in Section 11.7 blocked the \texttt{apt-get} install step and the socket access in a single change.
+
+\subsection{Detection Must Be Proactive}
+
+Every detection technique demonstrated in Chapter 10 has a reactive and a proactive mode. \texttt{auditd} deployed after the attack finds no historical records; deployed before the attack, it produces a full timeline. \texttt{docker inspect} run as a post-incident audit finds the misconfiguration; integrated into a CI/CD pipeline, it prevents the misconfiguration from reaching production. Falco configured at container start alerts on socket mounts before any exploitation occurs. The difference between detecting an attack and forensically reconstructing one after the fact is whether detection infrastructure was deployed before the attacker arrived.
+
+\subsection{The Daemon Is the Privilege Boundary}
+
+All Docker security ultimately depends on controlling who can reach \texttt{dockerd}. Socket access is daemon access; daemon access is host root. There is no privilege escalation required between those steps --- the API itself executes as root. This is why Rootless Docker and Podman represent architectural improvements rather than just configuration options: they eliminate the privileged daemon, removing the target that socket access was used to reach.
+
+% ---
+
+\section{Further Reading}
+
+\subsection*{Container Security Standards}
+\begin{itemize}
+    \item CIS Docker Benchmark --- Center for Internet Security. Explicitly flags \texttt{docker.sock} mounts as a critical finding.
+    \item NIST SP 800-190: Application Container Security Guide.
+    \item OWASP Docker Security Cheat Sheet.
+\end{itemize}
+
+\subsection*{CVEs Referenced}
+\begin{itemize}
+    \item CVE-2019-5736: runc \texttt{/proc/self/exe} container escape.
+    \item CVE-2020-15257: containerd abstract socket exposure.
+    \item CVE-2022-0492: cgroupv1 \texttt{release\_agent} privilege escalation.
+\end{itemize}
+
+\subsection*{Tools}
+\begin{itemize}
+    \item Falco (CNCF): \texttt{falco.org} --- runtime syscall-level security monitoring.
+    \item Trivy (Aqua Security): \texttt{aquasecurity.github.io/trivy} --- container image vulnerability scanning.
+    \item Kaniko (Google): \texttt{github.com/GoogleContainerTools/kaniko} --- daemonless Docker image builds for CI.
+    \item Docker Socket Proxy (Tecnativa): \texttt{github.com/Tecnativa/docker-socket-proxy} --- scoped API proxy.
+    \item Podman: \texttt{podman.io} --- daemonless, rootless container runtime.
+\end{itemize}
+
+\subsection*{Kernel and Runtime References}
+\begin{itemize}
+    \item \texttt{namespaces(7)} Linux man page --- authoritative reference on namespace types and semantics.
+    \item \texttt{capabilities(7)} Linux man page --- complete Linux capability list and effects.
+    \item \texttt{seccomp(2)} Linux man page --- seccomp filter mode and BPF rule structure.
+    \item OCI Runtime Specification: \texttt{github.com/opencontainers/runtime-spec} --- defines the container lifecycle and configuration schema.
+\end{itemize}
+
+\subsection*{Incident References}
+\begin{itemize}
+    \item Tesla Kubernetes breach (2018) --- RedLock Cloud Security Intelligence report.
+    \item Docker Hub malicious image campaign (2018) --- Docker official post-incident disclosure.
+\end{itemize}
+
+\subsection*{Books and Whitepapers}
+\begin{itemize}
+    \item Liz Rice, \textit{Container Security}. O'Reilly Media, 2020.
+    \item NCC Group, ``Understanding and Hardening Linux Containers'' --- technical whitepaper covering namespace internals, capability analysis, and container runtime security.
+\end{itemize}

